@@ -47,7 +47,6 @@
 #include "source/common/network/utility.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
-#include "source/extensions/config_subscription/grpc/grpc_subscription_impl.h"
 #include "source/server/transport_socket_config_impl.h"
 
 #include "absl/container/btree_map.h"
@@ -154,19 +153,9 @@ public:
   void tlsWrapperMissingPolicyInc() const { stats_.tls_wrapper_missing_policy_.inc(); }
 
 protected:
-  bool isNewStream() const {
-    auto sub = dynamic_cast<Config::GrpcSubscriptionImpl*>(subscription_.get());
-    if (!sub) {
-      ENVOY_LOG(error, "Cilium NetworkPolicyMapImpl: Cannot get GrpcSubscriptionImpl");
-      return false;
-    }
-    auto mux = dynamic_cast<GrpcMuxImpl*>(sub->grpcMux().get());
-    if (!mux) {
-      ENVOY_LOG(error, "Cilium NetworkPolicyMapImpl: Cannot get GrpcMuxImpl");
-      return false;
-    }
-    return mux->isNewStream();
-  }
+  uint64_t streamGeneration() const { return grpcStreamGeneration(subscription_.get()); }
+
+  void resetStreamForTest() { applied_stream_generation_ = 0; }
 
   // run the given function after all the threads have scheduled
   void runAfterAllThreads(std::function<void()> cb) const {
@@ -187,7 +176,8 @@ protected:
   createOrReusePolicy(const cilium::NetworkPolicy& config, const PolicyMapSnapshot& old_policy_map);
 
   void installNewPolicyMap(PolicyMapSnapshot&& new_policy_map,
-                           Init::ManagerImpl& version_init_manager, std::string&& version_name);
+                           Init::ManagerImpl& version_init_manager, std::string&& version_name,
+                           uint64_t stream_generation);
 
 private:
   // Helpers for atomic swap of the policy map pointer.
@@ -244,6 +234,10 @@ private:
       transport_factory_context_;
 
   std::unique_ptr<Envoy::Config::Subscription> subscription_;
+  // Value 0 is reserved for detection of the initial stream before the first
+  // successful policy install. Tracked gRPC subscriptions may also report 0
+  // before any stream has been established.
+  uint64_t applied_stream_generation_{0};
 
   ProtobufTypes::MessagePtr dumpNetworkPolicyConfigs(const Matchers::StringMatcher& name_matcher);
   Server::ConfigTracker::EntryOwnerPtr config_tracker_entry_;
@@ -2126,11 +2120,16 @@ NetworkPolicyMapImpl::createOrReusePolicy(const cilium::NetworkPolicy& config,
 
 void NetworkPolicyMapImpl::installNewPolicyMap(PolicyMapSnapshot&& new_policy_map,
                                                Init::ManagerImpl& version_init_manager,
-                                               std::string&& version_name) {
+                                               std::string&& version_name,
+                                               uint64_t stream_generation) {
   // Initialize SDS secrets. We do not wait for the completion.
   version_init_manager.initialize(Init::WatcherImpl(std::move(version_name), []() {}));
 
   const auto* old_policy_map = exchange(new PolicyMapSnapshot(std::move(new_policy_map)));
+
+  // Record stream state only after a successful install. The reserved value 0
+  // keeps the initial accepted update on any stream source classified as new.
+  applied_stream_generation_ = stream_generation;
 
   // Delete the old map once all worker threads have entered their event queues, as this
   // is proof that they no longer refer to the old map.
@@ -2160,6 +2159,8 @@ void NetworkPolicyMapImpl::removeInitManager() {
 absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     const std::vector<Envoy::Config::DecodedResourceRef>& resources,
     const std::string& version_info) {
+  auto stream_generation = streamGeneration();
+  const bool is_new_stream = stream_generation != applied_stream_generation_;
   ENVOY_LOG(debug, "NetworkPolicyMapImpl::onConfigUpdate({}), {} resources, version: {}",
             instance_id_, resources.size(), version_info);
   stats_.updates_total_.inc();
@@ -2168,7 +2169,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   // and that is also when the old stream terminates and a new one is created.
   // New security identities (e.g., for FQDN policies) only get inserted to the new IP cache,
   // so open it before the workers get a chance to enforce policy on the new IDs.
-  if (isNewStream()) {
+  if (is_new_stream) {
     ENVOY_LOG(info, "New NetworkPolicy stream");
 
     reopenIpcache();
@@ -2209,7 +2210,8 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   }
   removeInitManager();
 
-  installNewPolicyMap(std::move(new_policy_map), version_init_manager, std::move(version_name));
+  installNewPolicyMap(std::move(new_policy_map), version_init_manager, std::move(version_name),
+                      stream_generation);
 
   return absl::OkStatus();
 }

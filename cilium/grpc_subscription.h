@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -9,44 +10,23 @@
 #include "envoy/server/factory_context.h"
 #include "envoy/stats/scope.h"
 
-#include "source/extensions/config_subscription/grpc/grpc_mux_context.h"
-#include "source/extensions/config_subscription/grpc/grpc_mux_impl.h"
-
 namespace Envoy {
 namespace Cilium {
 
 // Cilium XDS API config source. Used for all Cilium XDS.
 extern envoy::config::core::v3::ConfigSource cilium_xds_api_config;
 
-// GrpcMux wrapper to get access to control plane identifier
-class GrpcMuxImpl : public Config::GrpcMuxImpl {
-public:
-  GrpcMuxImpl(Config::GrpcMuxContext& grpc_mux_context, bool skip_subsequent_node)
-      : Config::GrpcMuxImpl(grpc_mux_context, skip_subsequent_node) {}
-
-  ~GrpcMuxImpl() override = default;
-
-  void onStreamEstablished() override {
-    new_stream_ = true;
-    Config::GrpcMuxImpl::onStreamEstablished();
-  }
-
-  // isNewStream returns true for the first call after a new stream has been established
-  bool isNewStream() {
-    bool new_stream = new_stream_;
-    new_stream_ = false;
-    return new_stream;
-  }
-
-private:
-  bool new_stream_ = true;
-};
-
 std::unique_ptr<Config::Subscription>
 subscribe(const std::string& type_url, Server::Configuration::CommonFactoryContext& context,
           Stats::Scope& scope, Config::SubscriptionCallbacks& callbacks,
           Config::OpaqueResourceDecoderSharedPtr resource_decoder,
           std::chrono::milliseconds init_fetch_timeout = std::chrono::milliseconds(0));
+
+// Returns a monotonic stream generation for Cilium subscriptions.
+// Value 0 is reserved for policy-map detection of the initial stream and may be returned for
+// tracked gRPC subscriptions before any stream has been established.
+// Non-gRPC subscriptions and subscriptions without stream tracking are treated as generation 1.
+uint64_t grpcStreamGeneration(Config::Subscription* subscription);
 
 } // namespace Cilium
 } // namespace Envoy

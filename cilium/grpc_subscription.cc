@@ -3,6 +3,7 @@
 #include <fmt/format.h>
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -26,7 +27,9 @@
 #include "source/common/grpc/common.h"
 #include "source/common/protobuf/protobuf.h" // IWYU pragma: keep
 #include "source/extensions/config_subscription/grpc/grpc_mux_context.h"
+#include "source/extensions/config_subscription/grpc/grpc_mux_impl.h"
 #include "source/extensions/config_subscription/grpc/grpc_subscription_impl.h"
+#include "source/extensions/config_subscription/grpc/new_grpc_mux_impl.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
@@ -38,6 +41,50 @@ namespace Envoy {
 namespace Cilium {
 
 namespace {
+
+constexpr uint64_t FirstStreamGeneration = 1;
+
+class StreamTrackedGrpcMux {
+public:
+  virtual ~StreamTrackedGrpcMux() = default;
+  virtual uint64_t streamGeneration() const = 0;
+};
+
+class SotwGrpcMuxImpl : public Config::GrpcMuxImpl, public StreamTrackedGrpcMux {
+public:
+  SotwGrpcMuxImpl(Config::GrpcMuxContext& grpc_mux_context, bool skip_subsequent_node)
+      : Config::GrpcMuxImpl(grpc_mux_context, skip_subsequent_node) {}
+
+  ~SotwGrpcMuxImpl() override = default;
+
+  void onStreamEstablished() override {
+    ++stream_generation_;
+    Config::GrpcMuxImpl::onStreamEstablished();
+  }
+
+  uint64_t streamGeneration() const override { return stream_generation_; }
+
+private:
+  uint64_t stream_generation_{0};
+};
+
+class DeltaGrpcMuxImpl : public Config::NewGrpcMuxImpl, public StreamTrackedGrpcMux {
+public:
+  explicit DeltaGrpcMuxImpl(Config::GrpcMuxContext& grpc_mux_context)
+      : Config::NewGrpcMuxImpl(grpc_mux_context) {}
+
+  ~DeltaGrpcMuxImpl() override = default;
+
+  void onStreamEstablished() override {
+    ++stream_generation_;
+    Config::NewGrpcMuxImpl::onStreamEstablished();
+  }
+
+  uint64_t streamGeneration() const override { return stream_generation_; }
+
+private:
+  uint64_t stream_generation_{0};
+};
 
 // service RPC method fully qualified names.
 struct Service {
@@ -139,6 +186,20 @@ envoy::config::core::v3::ConfigSource getCiliumXDSAPIConfig() {
 
 envoy::config::core::v3::ConfigSource cilium_xds_api_config = getCiliumXDSAPIConfig();
 
+uint64_t grpcStreamGeneration(Config::Subscription* subscription) {
+  auto* sub = dynamic_cast<Config::GrpcSubscriptionImpl*>(subscription);
+  if (!sub) {
+    return FirstStreamGeneration;
+  }
+
+  auto* grpc_mux = dynamic_cast<StreamTrackedGrpcMux*>(sub->grpcMux().get());
+  if (grpc_mux == nullptr) {
+    return FirstStreamGeneration;
+  }
+
+  return grpc_mux->streamGeneration();
+}
+
 std::unique_ptr<Config::Subscription>
 subscribe(const std::string& type_url, Server::Configuration::CommonFactoryContext& context,
           Stats::Scope& scope, Config::SubscriptionCallbacks& callbacks,
@@ -185,7 +246,7 @@ subscribe(const std::string& type_url, Server::Configuration::CommonFactoryConte
   };
 
   std::shared_ptr<Config::GrpcMux> grpc_mux =
-      std::static_pointer_cast<Config::GrpcMux>(std::make_shared<GrpcMuxImpl>(
+      std::static_pointer_cast<Config::GrpcMux>(std::make_shared<SotwGrpcMuxImpl>(
           grpc_mux_context, api_config_source.set_node_on_first_message_only()));
 
   return std::make_unique<Config::GrpcSubscriptionImpl>(
