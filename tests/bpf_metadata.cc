@@ -49,10 +49,11 @@ std::string policy_path = "";
 
 std::vector<std::pair<std::string, std::string>> sds_configs{};
 
-namespace {
+namespace Cilium {
 
 std::shared_ptr<const Cilium::PolicyHostMap>
-createHostMap(const std::string& config, Server::Configuration::ListenerFactoryContext& context) {
+TestHelper::createHostMap(const std::string& config,
+                          Server::Configuration::ListenerFactoryContext& context) {
   return context.serverFactoryContext().singletonManager().getTyped<const Cilium::PolicyHostMap>(
       "cilium_host_map_singleton", [&config, &context] {
         std::string path = TestEnvironment::writeStringToFileForTest("host_map.yaml", config);
@@ -75,9 +76,9 @@ createHostMap(const std::string& config, Server::Configuration::ListenerFactoryC
 }
 
 std::shared_ptr<const Cilium::NetworkPolicyMap>
-createPolicyMap(const std::string& config,
-                const std::vector<std::pair<std::string, std::string>>& secret_configs,
-                Server::Configuration::FactoryContext& context) {
+TestHelper::createPolicyMap(const std::string& config,
+                            const std::vector<std::pair<std::string, std::string>>& secret_configs,
+                            Server::Configuration::FactoryContext& context) {
   return context.serverFactoryContext().singletonManager().getTyped<const Cilium::NetworkPolicyMap>(
       "cilium_network_policy_singleton", [&config, &secret_configs, &context] {
         if (!secret_configs.empty()) {
@@ -114,17 +115,15 @@ createPolicyMap(const std::string& config,
         auto map = std::make_shared<Cilium::NetworkPolicyMap>(context);
         auto subscription = std::make_unique<Envoy::Config::FilesystemSubscriptionImpl>(
             context.serverFactoryContext().mainThreadDispatcher(),
-            Envoy::Config::makePathConfigSource(policy_path), map->getImpl(),
+            Envoy::Config::makePathConfigSource(policy_path), map->subscriptionCallbacksForTest(),
             std::make_shared<Cilium::NetworkPolicyDecoder>(), stats,
             ProtobufMessage::getNullValidationVisitor(), context.serverFactoryContext().api());
-        map->startSubscription(std::move(subscription));
+        map->startSubscriptionForTest(std::move(subscription));
         return map;
       });
 }
 
-} // namespace
-
-void initTestMaps(Server::Configuration::ListenerFactoryContext& context) {
+void TestHelper::initTestMaps(Server::Configuration::ListenerFactoryContext& context) {
   // Create the file-based policy map before the filter is created, so that the
   // singleton is set before the gRPC subscription is attempted.
   hostmap = createHostMap(host_map_config, context);
@@ -133,7 +132,6 @@ void initTestMaps(Server::Configuration::ListenerFactoryContext& context) {
   npmap = createPolicyMap(policy_config, sds_configs, context);
 }
 
-namespace Cilium {
 namespace BpfMetadata {
 
 namespace {
@@ -209,7 +207,7 @@ public:
       const Network::ListenerFilterMatcherSharedPtr& listener_filter_matcher,
       ListenerFactoryContext& context) override {
 
-    initTestMaps(context);
+    Cilium::TestHelper::initTestMaps(context);
 
     auto config = std::make_shared<Cilium::BpfMetadata::TestConfig>(
         MessageUtil::downcastAndValidate<const ::cilium::TestBpfMetadata&>(

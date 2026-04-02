@@ -24,7 +24,6 @@
 #include "absl/synchronization/mutex.h"
 #include "cilium/api/npds.pb.h"
 #include "cilium/grpc_subscription.h"
-#include "cilium/network_policy.h"
 
 namespace Envoy {
 namespace Cilium {
@@ -51,9 +50,9 @@ GetSdsConfigFunc getSDSConfig = &getCiliumSDSConfig;
 void setSDSConfigFunc(GetSdsConfigFunc func) { getSDSConfig = func; }
 void resetSDSConfigFunc() { getSDSConfig = &getCiliumSDSConfig; }
 
-SecretWatcher::SecretWatcher(const NetworkPolicyMapImpl& parent, const std::string& sds_name)
-    : parent_(parent), name_(sds_name),
-      secret_provider_(secretProvider(parent.transportFactoryContext(), sds_name)),
+SecretWatcher::SecretWatcher(Server::Configuration::TransportSocketFactoryContext& context,
+                             const std::string& sds_name)
+    : context_(context), name_(sds_name), secret_provider_(secretProvider(context, sds_name)),
       update_secret_(readAndWatchSecret()) {}
 
 SecretWatcher::~SecretWatcher() {
@@ -72,7 +71,7 @@ Envoy::Common::CallbackHandlePtr SecretWatcher::readAndWatchSecret() {
 absl::Status SecretWatcher::store() {
   const auto* secret = secret_provider_->secret();
   if (secret != nullptr) {
-    Api::Api& api = parent_.transportFactoryContext().serverFactoryContext().api();
+    Api::Api& api = context_.serverFactoryContext().api();
     auto string_or_error = Config::DataSource::read(secret->secret(), true, api);
     if (!string_or_error.ok()) {
       return string_or_error.status();
@@ -80,8 +79,9 @@ absl::Status SecretWatcher::store() {
     std::string* p = new std::string(string_or_error.value());
     std::string* old = ptr_.exchange(p, std::memory_order_release);
     if (old != nullptr) {
-      // Delete old value after all threads have scheduled
-      parent_.runAfterAllThreads([old]() { delete old; });
+      // Delete old value after all worker threads have scheduled
+      context_.serverFactoryContext().threadLocal().runOnAllWorkerThreads([]() {},
+                                                                          [old]() { delete old; });
     }
   }
   return absl::OkStatus();
@@ -89,9 +89,10 @@ absl::Status SecretWatcher::store() {
 
 const std::string* SecretWatcher::load() const { return ptr_.load(std::memory_order_acquire); }
 
-TLSContext::TLSContext(const NetworkPolicyMapImpl& parent, const std::string& name)
-    : manager_(parent.transportFactoryContext().serverFactoryContext().sslContextManager()),
-      scope_(parent.transportFactoryContext().serverFactoryContext().serverScope()),
+TLSContext::TLSContext(Server::Configuration::TransportSocketFactoryContext& context,
+                       const std::string& name)
+    : manager_(context.serverFactoryContext().sslContextManager()),
+      scope_(context.serverFactoryContext().serverScope()),
       init_target_(fmt::format("TLS Context {} secret", name), []() {}) {}
 
 namespace {
@@ -134,9 +135,9 @@ void setCommonConfig(const cilium::TLSContext config,
 
 } // namespace
 
-DownstreamTLSContext::DownstreamTLSContext(const NetworkPolicyMapImpl& parent,
-                                           const cilium::TLSContext config)
-    : TLSContext(parent, "server") {
+DownstreamTLSContext::DownstreamTLSContext(
+    Server::Configuration::TransportSocketFactoryContext& context, const cilium::TLSContext config)
+    : TLSContext(context, "server") {
   // Server config always needs the TLS certificate to present to the client
   if (config.tls_sds_secret().empty() && config.certificate_chain().empty()) {
     throw EnvoyException("Downstream TLS Context: missing certificate chain");
@@ -156,7 +157,7 @@ DownstreamTLSContext::DownstreamTLSContext(const NetworkPolicyMapImpl& parent,
     server_names_.emplace_back(config.server_names(i));
   }
   auto server_config_or_error = Extensions::TransportSockets::Tls::ServerContextConfigImpl::create(
-      context_config, parent.transportFactoryContext(), false);
+      context_config, context, false);
   // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
   THROW_IF_NOT_OK(server_config_or_error.status());
   server_config_ = std::move(server_config_or_error.value());
@@ -180,13 +181,13 @@ DownstreamTLSContext::DownstreamTLSContext(const NetworkPolicyMapImpl& parent,
   if (server_config_->isReady()) {
     static_cast<void>(create_server_context());
   } else {
-    parent.transportFactoryContext().initManager().add(init_target_);
+    context.initManager().add(init_target_);
   }
 }
 
-UpstreamTLSContext::UpstreamTLSContext(const NetworkPolicyMapImpl& parent,
-                                       cilium::TLSContext config)
-    : TLSContext(parent, "client") {
+UpstreamTLSContext::UpstreamTLSContext(
+    Server::Configuration::TransportSocketFactoryContext& context, cilium::TLSContext config)
+    : TLSContext(context, "client") {
   // Client context always needs the trusted CA for server certificate validation
   // TODO: Default to system default trusted CAs?
   if (config.validation_context_sds_secret().empty() && config.trusted_ca().empty()) {
@@ -203,8 +204,8 @@ UpstreamTLSContext::UpstreamTLSContext(const NetworkPolicyMapImpl& parent,
     }
     context_config.set_sni(config.server_names(0));
   }
-  auto client_config_or_error = Extensions::TransportSockets::Tls::ClientContextConfigImpl::create(
-      context_config, parent.transportFactoryContext());
+  auto client_config_or_error =
+      Extensions::TransportSockets::Tls::ClientContextConfigImpl::create(context_config, context);
   // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
   THROW_IF_NOT_OK(client_config_or_error.status());
 
@@ -227,7 +228,7 @@ UpstreamTLSContext::UpstreamTLSContext(const NetworkPolicyMapImpl& parent,
   if (client_config_->isReady()) {
     static_cast<void>(create_client_context());
   } else {
-    parent.transportFactoryContext().initManager().add(init_target_);
+    context.initManager().add(init_target_);
   }
 }
 

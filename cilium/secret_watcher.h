@@ -11,6 +11,7 @@
 #include "envoy/ssl/context.h"
 #include "envoy/ssl/context_config.h"
 #include "envoy/ssl/context_manager.h"
+#include "envoy/ssl/private_key/private_key.h"
 #include "envoy/stats/scope.h"
 
 #include "source/common/common/logger.h"
@@ -20,7 +21,6 @@
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
 #include "cilium/api/npds.pb.h"
-#include "cilium/network_policy.h"
 
 namespace Envoy {
 namespace Cilium {
@@ -33,7 +33,8 @@ void resetSDSConfigFunc();
 
 class SecretWatcher : public Logger::Loggable<Logger::Id::config> {
 public:
-  SecretWatcher(const NetworkPolicyMapImpl& parent, const std::string& sds_name);
+  SecretWatcher(Server::Configuration::TransportSocketFactoryContext& context,
+                const std::string& sds_name);
   ~SecretWatcher();
 
   const std::string& name() const { return name_; }
@@ -44,7 +45,7 @@ private:
   absl::Status store();
   const std::string* load() const;
 
-  const NetworkPolicyMapImpl& parent_;
+  Server::Configuration::TransportSocketFactoryContext& context_;
   const std::string name_;
   std::atomic<std::string*> ptr_{nullptr};
   Secret::GenericSecretConfigProviderSharedPtr secret_provider_;
@@ -58,7 +59,8 @@ public:
   TLSContext() = delete;
 
 protected:
-  TLSContext(const NetworkPolicyMapImpl& parent, const std::string& name);
+  TLSContext(Server::Configuration::TransportSocketFactoryContext& context,
+             const std::string& name);
 
   Envoy::Ssl::ContextManager& manager_;
   Stats::Scope& scope_;
@@ -68,7 +70,8 @@ protected:
 
 class DownstreamTLSContext : protected TLSContext {
 public:
-  DownstreamTLSContext(const NetworkPolicyMapImpl& parent, const cilium::TLSContext config);
+  DownstreamTLSContext(Server::Configuration::TransportSocketFactoryContext& context,
+                       const cilium::TLSContext config);
   ~DownstreamTLSContext() { manager_.removeContext(server_context_); }
 
   const Ssl::ContextConfig& getTlsContextConfig() const { return *server_config_; }
@@ -87,7 +90,8 @@ using DownstreamTLSContextSharedPtr = std::shared_ptr<DownstreamTLSContext>;
 
 class UpstreamTLSContext : protected TLSContext {
 public:
-  UpstreamTLSContext(const NetworkPolicyMapImpl& parent, cilium::TLSContext config);
+  UpstreamTLSContext(Server::Configuration::TransportSocketFactoryContext& context,
+                     cilium::TLSContext config);
   ~UpstreamTLSContext() { manager_.removeContext(client_context_); }
 
   const Ssl::ContextConfig& getTlsContextConfig() const { return *client_config_; }

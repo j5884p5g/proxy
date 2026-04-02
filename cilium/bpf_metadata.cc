@@ -176,27 +176,6 @@ SINGLETON_MANAGER_REGISTRATION(cilium_bpf_conntrack);
 SINGLETON_MANAGER_REGISTRATION(cilium_host_map);
 SINGLETON_MANAGER_REGISTRATION(cilium_network_policy);
 
-namespace {
-
-std::shared_ptr<const Cilium::PolicyHostMap>
-createHostMap(Server::Configuration::ListenerFactoryContext& context) {
-  return context.serverFactoryContext().singletonManager().getTyped<const Cilium::PolicyHostMap>(
-      SINGLETON_MANAGER_REGISTERED_NAME(cilium_host_map), [&context] {
-        auto map = std::make_shared<Cilium::PolicyHostMap>(context.serverFactoryContext());
-        map->startSubscription(context.serverFactoryContext());
-        return map;
-      });
-}
-
-std::shared_ptr<const Cilium::NetworkPolicyMap>
-createPolicyMap(Server::Configuration::FactoryContext& context) {
-  return context.serverFactoryContext().singletonManager().getTyped<const Cilium::NetworkPolicyMap>(
-      SINGLETON_MANAGER_REGISTERED_NAME(cilium_network_policy),
-      [&context] { return std::make_shared<Cilium::NetworkPolicyMap>(context, true); });
-}
-
-} // namespace
-
 Config::Config(const ::cilium::BpfMetadata& config,
                Server::Configuration::ListenerFactoryContext& context)
     : so_linger_(config.has_original_source_so_linger_time()
@@ -236,7 +215,13 @@ Config::Config(const ::cilium::BpfMetadata& config,
   }
 
   if (config.use_nphds()) {
-    hosts_ = createHostMap(context);
+    hosts_ =
+        context.serverFactoryContext().singletonManager().getTyped<const Cilium::PolicyHostMap>(
+            SINGLETON_MANAGER_REGISTERED_NAME(cilium_host_map), [&context] {
+              auto map = std::make_shared<Cilium::PolicyHostMap>(context.serverFactoryContext());
+              map->startSubscription(context.serverFactoryContext());
+              return map;
+            });
   }
 
   // Note: all instances use the bpf root of the first filter with non-empty
@@ -273,7 +258,10 @@ Config::Config(const ::cilium::BpfMetadata& config,
   // instances!
   // Only created if either ipcache_ or hosts_ map exists
   if (ipcache_ || hosts_) {
-    npmap_ = createPolicyMap(context);
+    npmap_ =
+        context.serverFactoryContext().singletonManager().getTyped<const Cilium::NetworkPolicyMap>(
+            SINGLETON_MANAGER_REGISTERED_NAME(cilium_network_policy),
+            [&context] { return std::make_shared<Cilium::NetworkPolicyMap>(context, true); });
   }
 }
 

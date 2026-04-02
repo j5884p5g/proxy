@@ -171,10 +171,8 @@ PolicyHostMap::PolicyHostMap(Server::Configuration::CommonFactoryContext& contex
 }
 
 void PolicyHostMap::startSubscription(Server::Configuration::CommonFactoryContext& context) {
-  subscription_ = subscribe("type.googleapis.com/cilium.NetworkPolicyHosts", context.localInfo(),
-                            context.clusterManager(), context.mainThreadDispatcher(),
-                            context.api().randomGenerator(), *scope_, *this,
-                            std::make_shared<Cilium::PolicyHostDecoder>());
+  subscription_ = subscribe("type.googleapis.com/cilium.NetworkPolicyHosts", context, *scope_,
+                            *this, std::make_shared<Cilium::PolicyHostDecoder>());
   subscription_->start({});
 }
 
