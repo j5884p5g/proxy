@@ -122,6 +122,15 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "versioned_test",
+    srcs = ["versioned_test.cc"],
+    repository = "@envoy",
+    deps = [
+        "//cilium:versioned_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "metadata_config_test",
     srcs = ["metadata_config_test.cc"],
     repository = "@envoy",

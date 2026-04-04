@@ -105,6 +105,7 @@ TypeUrlToServiceMap* buildTypeUrlToServiceMap() {
   // https://www.mail-archive.com/protobuf@googlegroups.com/msg04540.html.
   for (absl::string_view name : {
            "cilium.NetworkPolicyDiscoveryService",
+           "cilium.NetworkPolicyResourceDiscoveryService",
            "cilium.NetworkPolicyHostsDiscoveryService",
        }) {
     const auto* service_desc =
@@ -168,9 +169,9 @@ const Protobuf::MethodDescriptor& sotwGrpcMethod(absl::string_view type_url) {
 
 // Hard-coded Cilium gRPC cluster
 // Note: No rate-limit settings are used, consider if needed.
-envoy::config::core::v3::ConfigSource getCiliumXDSAPIConfig() {
+envoy::config::core::v3::ConfigSource getCiliumXDSAPIConfig(bool use_delta_xds = false) {
   auto config_source = envoy::config::core::v3::ConfigSource();
-  /* config_source.initial_fetch_timeout is set to 50 millliseconds.
+  /* config_source.initial_fetch_timeout is set to 50 milliseconds.
    * This applies only to SDS Secrets for now, as for NPDS and NPHDS we explicitly set the timeout
    * as 0 (no timeout).
    */
@@ -178,7 +179,9 @@ envoy::config::core::v3::ConfigSource getCiliumXDSAPIConfig() {
   config_source.set_resource_api_version(envoy::config::core::v3::ApiVersion::V3);
   auto api_config_source = config_source.mutable_api_config_source();
   api_config_source->set_set_node_on_first_message_only(true);
-  api_config_source->set_api_type(envoy::config::core::v3::ApiConfigSource::GRPC);
+  api_config_source->set_api_type(use_delta_xds
+                                      ? envoy::config::core::v3::ApiConfigSource::DELTA_GRPC
+                                      : envoy::config::core::v3::ApiConfigSource::GRPC);
   api_config_source->set_transport_api_version(envoy::config::core::v3::ApiVersion::V3);
   api_config_source->add_grpc_services()->mutable_envoy_grpc()->set_cluster_name("xds-grpc-cilium");
   return config_source;
@@ -203,9 +206,9 @@ uint64_t grpcStreamGeneration(Config::Subscription* subscription) {
 std::unique_ptr<Config::Subscription>
 subscribe(const std::string& type_url, Server::Configuration::CommonFactoryContext& context,
           Stats::Scope& scope, Config::SubscriptionCallbacks& callbacks,
-          Config::OpaqueResourceDecoderSharedPtr resource_decoder,
+          Config::OpaqueResourceDecoderSharedPtr resource_decoder, bool use_delta_xds,
           std::chrono::milliseconds init_fetch_timeout) {
-  const envoy::config::core::v3::ConfigSource config_source = getCiliumXDSAPIConfig();
+  const envoy::config::core::v3::ConfigSource config_source = getCiliumXDSAPIConfig(use_delta_xds);
   const envoy::config::core::v3::ApiConfigSource& api_config_source =
       config_source.api_config_source();
   THROW_IF_NOT_OK(Config::Utility::checkApiConfigSourceSubscriptionBackingCluster(
@@ -230,7 +233,7 @@ subscribe(const std::string& type_url, Server::Configuration::CommonFactoryConte
           factory_or_error.value()->createUncachedRawAsyncClient(), Grpc::RawAsyncClientPtr),
       /*failover_async_client_=*/nullptr,
       /*dispatcher_=*/context.mainThreadDispatcher(),
-      /*service_method_=*/sotwGrpcMethod(type_url),
+      /*service_method_=*/use_delta_xds ? deltaGrpcMethod(type_url) : sotwGrpcMethod(type_url),
       /*local_info_=*/context.localInfo(),
       /*rate_limit_settings_=*/rate_limit_settings_or_error.value(),
       /*scope_=*/scope,
@@ -246,8 +249,10 @@ subscribe(const std::string& type_url, Server::Configuration::CommonFactoryConte
   };
 
   std::shared_ptr<Config::GrpcMux> grpc_mux =
-      std::static_pointer_cast<Config::GrpcMux>(std::make_shared<SotwGrpcMuxImpl>(
-          grpc_mux_context, api_config_source.set_node_on_first_message_only()));
+      use_delta_xds ? std::static_pointer_cast<Config::GrpcMux>(
+                          std::make_shared<DeltaGrpcMuxImpl>(grpc_mux_context))
+                    : std::static_pointer_cast<Config::GrpcMux>(std::make_shared<SotwGrpcMuxImpl>(
+                          grpc_mux_context, api_config_source.set_node_on_first_message_only()));
 
   return std::make_unique<Config::GrpcSubscriptionImpl>(
       grpc_mux, callbacks, resource_decoder, stats, type_url, context.mainThreadDispatcher(),

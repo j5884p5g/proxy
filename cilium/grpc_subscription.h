@@ -7,7 +7,7 @@
 
 #include "envoy/config/core/v3/config_source.pb.h"
 #include "envoy/config/subscription.h"
-#include "envoy/server/factory_context.h"
+#include "envoy/ssl/context_manager.h"
 #include "envoy/stats/scope.h"
 
 namespace Envoy {
@@ -19,7 +19,7 @@ extern envoy::config::core::v3::ConfigSource cilium_xds_api_config;
 std::unique_ptr<Config::Subscription>
 subscribe(const std::string& type_url, Server::Configuration::CommonFactoryContext& context,
           Stats::Scope& scope, Config::SubscriptionCallbacks& callbacks,
-          Config::OpaqueResourceDecoderSharedPtr resource_decoder,
+          Config::OpaqueResourceDecoderSharedPtr resource_decoder, bool use_delta_xds = false,
           std::chrono::milliseconds init_fetch_timeout = std::chrono::milliseconds(0));
 
 // Returns a monotonic stream generation for Cilium subscriptions.

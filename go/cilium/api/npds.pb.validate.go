@@ -39,6 +39,294 @@ var (
 	_ = corev3.SocketAddress_Protocol(0)
 )
 
+// Validate checks the field values on NetworkPolicyResource with the rules
+// defined in the proto definition for this message. If any rules are
+// violated, the first error encountered is returned, or nil if there are no violations.
+func (m *NetworkPolicyResource) Validate() error {
+	return m.validate(false)
+}
+
+// ValidateAll checks the field values on NetworkPolicyResource with the rules
+// defined in the proto definition for this message. If any rules are
+// violated, the result is a list of violation errors wrapped in
+// NetworkPolicyResourceMultiError, or nil if none found.
+func (m *NetworkPolicyResource) ValidateAll() error {
+	return m.validate(true)
+}
+
+func (m *NetworkPolicyResource) validate(all bool) error {
+	if m == nil {
+		return nil
+	}
+
+	var errors []error
+
+	switch v := m.Resource.(type) {
+	case *NetworkPolicyResource_Policy:
+		if v == nil {
+			err := NetworkPolicyResourceValidationError{
+				field:  "Resource",
+				reason: "oneof value cannot be a typed-nil",
+			}
+			if !all {
+				return err
+			}
+			errors = append(errors, err)
+		}
+
+		if all {
+			switch v := interface{}(m.GetPolicy()).(type) {
+			case interface{ ValidateAll() error }:
+				if err := v.ValidateAll(); err != nil {
+					errors = append(errors, NetworkPolicyResourceValidationError{
+						field:  "Policy",
+						reason: "embedded message failed validation",
+						cause:  err,
+					})
+				}
+			case interface{ Validate() error }:
+				if err := v.Validate(); err != nil {
+					errors = append(errors, NetworkPolicyResourceValidationError{
+						field:  "Policy",
+						reason: "embedded message failed validation",
+						cause:  err,
+					})
+				}
+			}
+		} else if v, ok := interface{}(m.GetPolicy()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return NetworkPolicyResourceValidationError{
+					field:  "Policy",
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
+
+	case *NetworkPolicyResource_Selector:
+		if v == nil {
+			err := NetworkPolicyResourceValidationError{
+				field:  "Resource",
+				reason: "oneof value cannot be a typed-nil",
+			}
+			if !all {
+				return err
+			}
+			errors = append(errors, err)
+		}
+
+		if all {
+			switch v := interface{}(m.GetSelector()).(type) {
+			case interface{ ValidateAll() error }:
+				if err := v.ValidateAll(); err != nil {
+					errors = append(errors, NetworkPolicyResourceValidationError{
+						field:  "Selector",
+						reason: "embedded message failed validation",
+						cause:  err,
+					})
+				}
+			case interface{ Validate() error }:
+				if err := v.Validate(); err != nil {
+					errors = append(errors, NetworkPolicyResourceValidationError{
+						field:  "Selector",
+						reason: "embedded message failed validation",
+						cause:  err,
+					})
+				}
+			}
+		} else if v, ok := interface{}(m.GetSelector()).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return NetworkPolicyResourceValidationError{
+					field:  "Selector",
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
+
+	default:
+		_ = v // ensures v is used
+	}
+
+	if len(errors) > 0 {
+		return NetworkPolicyResourceMultiError(errors)
+	}
+
+	return nil
+}
+
+// NetworkPolicyResourceMultiError is an error wrapping multiple validation
+// errors returned by NetworkPolicyResource.ValidateAll() if the designated
+// constraints aren't met.
+type NetworkPolicyResourceMultiError []error
+
+// Error returns a concatenation of all the error messages it wraps.
+func (m NetworkPolicyResourceMultiError) Error() string {
+	msgs := make([]string, 0, len(m))
+	for _, err := range m {
+		msgs = append(msgs, err.Error())
+	}
+	return strings.Join(msgs, "; ")
+}
+
+// AllErrors returns a list of validation violation errors.
+func (m NetworkPolicyResourceMultiError) AllErrors() []error { return m }
+
+// NetworkPolicyResourceValidationError is the validation error returned by
+// NetworkPolicyResource.Validate if the designated constraints aren't met.
+type NetworkPolicyResourceValidationError struct {
+	field  string
+	reason string
+	cause  error
+	key    bool
+}
+
+// Field function returns field value.
+func (e NetworkPolicyResourceValidationError) Field() string { return e.field }
+
+// Reason function returns reason value.
+func (e NetworkPolicyResourceValidationError) Reason() string { return e.reason }
+
+// Cause function returns cause value.
+func (e NetworkPolicyResourceValidationError) Cause() error { return e.cause }
+
+// Key function returns key value.
+func (e NetworkPolicyResourceValidationError) Key() bool { return e.key }
+
+// ErrorName returns error name.
+func (e NetworkPolicyResourceValidationError) ErrorName() string {
+	return "NetworkPolicyResourceValidationError"
+}
+
+// Error satisfies the builtin error interface
+func (e NetworkPolicyResourceValidationError) Error() string {
+	cause := ""
+	if e.cause != nil {
+		cause = fmt.Sprintf(" | caused by: %v", e.cause)
+	}
+
+	key := ""
+	if e.key {
+		key = "key for "
+	}
+
+	return fmt.Sprintf(
+		"invalid %sNetworkPolicyResource.%s: %s%s",
+		key,
+		e.field,
+		e.reason,
+		cause)
+}
+
+var _ error = NetworkPolicyResourceValidationError{}
+
+var _ interface {
+	Field() string
+	Reason() string
+	Key() bool
+	Cause() error
+	ErrorName() string
+} = NetworkPolicyResourceValidationError{}
+
+// Validate checks the field values on Selector with the rules defined in the
+// proto definition for this message. If any rules are violated, the first
+// error encountered is returned, or nil if there are no violations.
+func (m *Selector) Validate() error {
+	return m.validate(false)
+}
+
+// ValidateAll checks the field values on Selector with the rules defined in
+// the proto definition for this message. If any rules are violated, the
+// result is a list of violation errors wrapped in SelectorMultiError, or nil
+// if none found.
+func (m *Selector) ValidateAll() error {
+	return m.validate(true)
+}
+
+func (m *Selector) validate(all bool) error {
+	if m == nil {
+		return nil
+	}
+
+	var errors []error
+
+	if len(errors) > 0 {
+		return SelectorMultiError(errors)
+	}
+
+	return nil
+}
+
+// SelectorMultiError is an error wrapping multiple validation errors returned
+// by Selector.ValidateAll() if the designated constraints aren't met.
+type SelectorMultiError []error
+
+// Error returns a concatenation of all the error messages it wraps.
+func (m SelectorMultiError) Error() string {
+	msgs := make([]string, 0, len(m))
+	for _, err := range m {
+		msgs = append(msgs, err.Error())
+	}
+	return strings.Join(msgs, "; ")
+}
+
+// AllErrors returns a list of validation violation errors.
+func (m SelectorMultiError) AllErrors() []error { return m }
+
+// SelectorValidationError is the validation error returned by
+// Selector.Validate if the designated constraints aren't met.
+type SelectorValidationError struct {
+	field  string
+	reason string
+	cause  error
+	key    bool
+}
+
+// Field function returns field value.
+func (e SelectorValidationError) Field() string { return e.field }
+
+// Reason function returns reason value.
+func (e SelectorValidationError) Reason() string { return e.reason }
+
+// Cause function returns cause value.
+func (e SelectorValidationError) Cause() error { return e.cause }
+
+// Key function returns key value.
+func (e SelectorValidationError) Key() bool { return e.key }
+
+// ErrorName returns error name.
+func (e SelectorValidationError) ErrorName() string { return "SelectorValidationError" }
+
+// Error satisfies the builtin error interface
+func (e SelectorValidationError) Error() string {
+	cause := ""
+	if e.cause != nil {
+		cause = fmt.Sprintf(" | caused by: %v", e.cause)
+	}
+
+	key := ""
+	if e.key {
+		key = "key for "
+	}
+
+	return fmt.Sprintf(
+		"invalid %sSelector.%s: %s%s",
+		key,
+		e.field,
+		e.reason,
+		cause)
+}
+
+var _ error = SelectorValidationError{}
+
+var _ interface {
+	Field() string
+	Reason() string
+	Key() bool
+	Cause() error
+	ErrorName() string
+} = SelectorValidationError{}
+
 // Validate checks the field values on NetworkPolicy with the rules defined in
 // the proto definition for this message. If any rules are violated, the first
 // error encountered is returned, or nil if there are no violations.

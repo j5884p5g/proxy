@@ -29,6 +29,17 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "versioned_lib",
+    hdrs = ["versioned.h"],
+    repository = "@envoy",
+    deps = [
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@envoy//source/common/common:assert_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "network_policy_lib",
     srcs = [
         "network_policy.cc",
@@ -45,6 +56,7 @@ envoy_cc_library(
         "//cilium:conntrack_lib",
         "//cilium:grpc_subscription_lib",
         "//cilium:ipcache_lib",
+        "//cilium:versioned_lib",
         "//cilium/api:npds_cc_proto",
         "@envoy//envoy/config:subscription_interface",
         "@envoy//envoy/singleton:manager_interface",

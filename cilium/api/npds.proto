@@ -17,6 +17,7 @@ import "validate/validate.proto";
 // [#protodoc-title: Network policy management and NPDS]
 
 // Each resource name is a network policy identifier.
+// Deprecated: This service will be removed when Cilium 1.20 is the oldest supported release.
 service NetworkPolicyDiscoveryService {
   option (envoy.annotations.resource).type = "cilium.NetworkPolicy";
 
@@ -31,6 +32,32 @@ service NetworkPolicyDiscoveryService {
       body: "*"
     };
   }
+}
+
+// Policy and selector resource names are exact-match identifiers in delta NPDS.
+service NetworkPolicyResourceDiscoveryService {
+  option (envoy.annotations.resource).type = "cilium.NetworkPolicyResource";
+
+  rpc DeltaNetworkPolicyResources(stream envoy.service.discovery.v3.DeltaDiscoveryRequest)
+      returns (stream envoy.service.discovery.v3.DeltaDiscoveryResponse) {
+  }
+}
+
+// A delta NPDS resource that carries either an endpoint policy or a shared selector.
+message NetworkPolicyResource {
+  oneof resource {
+    NetworkPolicy policy = 1;
+    Selector selector = 2;
+  }
+}
+
+// A shared set of remote identities referenced by selector resource name.
+// Unlike the old state-of-the-world remote identity lists, an empty selector
+// matches nothing.
+message Selector {
+  // The set of numeric remote security IDs selected by this selector.
+  // If empty, this selector selects no remote identities.
+  repeated uint32 remote_identities = 1;
 }
 
 // A network policy that is enforced by a filter on the network flows to/from
@@ -152,6 +179,12 @@ message PortNetworkPolicyRule {
   // applied on the flow's remote host is contained in this set.
   // Optional. If not specified, any remote host is matched by this predicate.
   repeated uint32 remote_policies = 7;
+
+  // Optional selector resource names that can be resolved to shared remote
+  // policy sets in delta NPDS.
+  // Selector references are matched by exact selector resource name.
+  // Optional. If not specified, any remote host is matched by this predicate.
+  repeated string selectors = 11;
 
   // Optional downstream TLS context. If present, the incoming connection must
   // be a TLS connection.

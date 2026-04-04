@@ -29,6 +29,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // Each resource name is a network policy identifier.
+// Deprecated: This service will be removed when Cilium 1.20 is the oldest supported release.
 type NetworkPolicyDiscoveryServiceClient interface {
 	StreamNetworkPolicies(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[v3.DiscoveryRequest, v3.DiscoveryResponse], error)
 	FetchNetworkPolicies(ctx context.Context, in *v3.DiscoveryRequest, opts ...grpc.CallOption) (*v3.DiscoveryResponse, error)
@@ -70,6 +71,7 @@ func (c *networkPolicyDiscoveryServiceClient) FetchNetworkPolicies(ctx context.C
 // for forward compatibility.
 //
 // Each resource name is a network policy identifier.
+// Deprecated: This service will be removed when Cilium 1.20 is the oldest supported release.
 type NetworkPolicyDiscoveryServiceServer interface {
 	StreamNetworkPolicies(grpc.BidiStreamingServer[v3.DiscoveryRequest, v3.DiscoveryResponse]) error
 	FetchNetworkPolicies(context.Context, *v3.DiscoveryRequest) (*v3.DiscoveryResponse, error)
@@ -152,6 +154,107 @@ var NetworkPolicyDiscoveryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamNetworkPolicies",
 			Handler:       _NetworkPolicyDiscoveryService_StreamNetworkPolicies_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "cilium/api/npds.proto",
+}
+
+const (
+	NetworkPolicyResourceDiscoveryService_DeltaNetworkPolicyResources_FullMethodName = "/cilium.NetworkPolicyResourceDiscoveryService/DeltaNetworkPolicyResources"
+)
+
+// NetworkPolicyResourceDiscoveryServiceClient is the client API for NetworkPolicyResourceDiscoveryService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Policy and selector resource names are exact-match identifiers in delta NPDS.
+type NetworkPolicyResourceDiscoveryServiceClient interface {
+	DeltaNetworkPolicyResources(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[v3.DeltaDiscoveryRequest, v3.DeltaDiscoveryResponse], error)
+}
+
+type networkPolicyResourceDiscoveryServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewNetworkPolicyResourceDiscoveryServiceClient(cc grpc.ClientConnInterface) NetworkPolicyResourceDiscoveryServiceClient {
+	return &networkPolicyResourceDiscoveryServiceClient{cc}
+}
+
+func (c *networkPolicyResourceDiscoveryServiceClient) DeltaNetworkPolicyResources(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[v3.DeltaDiscoveryRequest, v3.DeltaDiscoveryResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &NetworkPolicyResourceDiscoveryService_ServiceDesc.Streams[0], NetworkPolicyResourceDiscoveryService_DeltaNetworkPolicyResources_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[v3.DeltaDiscoveryRequest, v3.DeltaDiscoveryResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type NetworkPolicyResourceDiscoveryService_DeltaNetworkPolicyResourcesClient = grpc.BidiStreamingClient[v3.DeltaDiscoveryRequest, v3.DeltaDiscoveryResponse]
+
+// NetworkPolicyResourceDiscoveryServiceServer is the server API for NetworkPolicyResourceDiscoveryService service.
+// All implementations must embed UnimplementedNetworkPolicyResourceDiscoveryServiceServer
+// for forward compatibility.
+//
+// Policy and selector resource names are exact-match identifiers in delta NPDS.
+type NetworkPolicyResourceDiscoveryServiceServer interface {
+	DeltaNetworkPolicyResources(grpc.BidiStreamingServer[v3.DeltaDiscoveryRequest, v3.DeltaDiscoveryResponse]) error
+	mustEmbedUnimplementedNetworkPolicyResourceDiscoveryServiceServer()
+}
+
+// UnimplementedNetworkPolicyResourceDiscoveryServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedNetworkPolicyResourceDiscoveryServiceServer struct{}
+
+func (UnimplementedNetworkPolicyResourceDiscoveryServiceServer) DeltaNetworkPolicyResources(grpc.BidiStreamingServer[v3.DeltaDiscoveryRequest, v3.DeltaDiscoveryResponse]) error {
+	return status.Error(codes.Unimplemented, "method DeltaNetworkPolicyResources not implemented")
+}
+func (UnimplementedNetworkPolicyResourceDiscoveryServiceServer) mustEmbedUnimplementedNetworkPolicyResourceDiscoveryServiceServer() {
+}
+func (UnimplementedNetworkPolicyResourceDiscoveryServiceServer) testEmbeddedByValue() {}
+
+// UnsafeNetworkPolicyResourceDiscoveryServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to NetworkPolicyResourceDiscoveryServiceServer will
+// result in compilation errors.
+type UnsafeNetworkPolicyResourceDiscoveryServiceServer interface {
+	mustEmbedUnimplementedNetworkPolicyResourceDiscoveryServiceServer()
+}
+
+func RegisterNetworkPolicyResourceDiscoveryServiceServer(s grpc.ServiceRegistrar, srv NetworkPolicyResourceDiscoveryServiceServer) {
+	// If the following call panics, it indicates UnimplementedNetworkPolicyResourceDiscoveryServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&NetworkPolicyResourceDiscoveryService_ServiceDesc, srv)
+}
+
+func _NetworkPolicyResourceDiscoveryService_DeltaNetworkPolicyResources_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(NetworkPolicyResourceDiscoveryServiceServer).DeltaNetworkPolicyResources(&grpc.GenericServerStream[v3.DeltaDiscoveryRequest, v3.DeltaDiscoveryResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type NetworkPolicyResourceDiscoveryService_DeltaNetworkPolicyResourcesServer = grpc.BidiStreamingServer[v3.DeltaDiscoveryRequest, v3.DeltaDiscoveryResponse]
+
+// NetworkPolicyResourceDiscoveryService_ServiceDesc is the grpc.ServiceDesc for NetworkPolicyResourceDiscoveryService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var NetworkPolicyResourceDiscoveryService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "cilium.NetworkPolicyResourceDiscoveryService",
+	HandlerType: (*NetworkPolicyResourceDiscoveryServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "DeltaNetworkPolicyResources",
+			Handler:       _NetworkPolicyResourceDiscoveryService_DeltaNetworkPolicyResources_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

@@ -23,6 +23,7 @@
 #include "source/common/common/logger.h"
 #include "source/common/common/macros.h"
 #include "source/common/common/thread.h"
+#include "source/common/config/opaque_resource_decoder_impl.h"
 #include "source/common/protobuf/message_validator_impl.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
@@ -39,6 +40,7 @@ namespace Cilium {
 
 class PortNetworkPolicyRules;
 class PolicySnapshot;
+using SelectorVersion = uint64_t;
 
 // PortPolicy holds a reference to a set of rules in a policy map that apply to the given port.
 // Methods then iterate through the set to determine if policy allows or denies. This is needed to
@@ -49,7 +51,7 @@ protected:
   friend class PortNetworkPolicy;
   friend class DenyAllPolicyInstanceImpl;
   friend class AllowAllEgressPolicyInstanceImpl;
-  PortPolicy(const PolicySnapshot& map, uint16_t port);
+  PortPolicy(const PolicySnapshot& map, uint16_t port, SelectorVersion selector_version);
 
 public:
   // If hasHttpRules() returns false, then HTTP policy enforcement can be skipped,
@@ -95,6 +97,7 @@ private:
   //   rules.
   const PortNetworkPolicyRules* port_rules_;
   const bool has_http_rules_;
+  const SelectorVersion selector_version_;
 };
 
 class IpAddressPair {
@@ -166,6 +169,9 @@ private:
   ProtobufMessage::ValidationVisitor& validation_visitor_;
 };
 
+using NetworkPolicyResourceDecoder =
+    Envoy::Config::OpaqueResourceDecoderImpl<cilium::NetworkPolicyResource>;
+
 /**
  * All Cilium L7 filter stats. @see stats_macros.h
  */
@@ -187,10 +193,12 @@ class NetworkPolicyMapImpl;
 
 class NetworkPolicyMap : public Singleton::Instance, public Logger::Loggable<Logger::Id::config> {
 public:
-  NetworkPolicyMap(Server::Configuration::FactoryContext& context, bool subscribe = false);
+  NetworkPolicyMap(Server::Configuration::FactoryContext& context, bool subscribe = false,
+                   bool use_delta_xds = false);
   ~NetworkPolicyMap() override;
 
   bool exists(const std::string& endpoint_policy_name) const;
+  bool useDeltaXds() const;
 
   const PolicyInstance& getPolicyInstance(const std::string& endpoint_policy_name,
                                           bool allow_egress) const;
@@ -202,12 +210,17 @@ protected:
   friend class CiliumNetworkPolicyTest;
   friend struct TestHelper;
   PolicyStats& statsForTest() const;
+  void resetStreamForTest();
+  PolicyInstanceConstSharedPtr
+  getPolicyInstanceSharedForTest(const std::string& endpoint_policy_name) const;
+  uint64_t policySelectorStreamGenerationForTest(const PolicyInstance& policy) const;
+  SelectorVersion policySelectorVersionForTest(const PolicyInstance& policy) const;
   void startSubscriptionForTest(std::unique_ptr<Envoy::Config::Subscription>&& subscription);
   Envoy::Config::SubscriptionCallbacks& subscriptionCallbacksForTest() const;
 
 private:
   Server::Configuration::ServerFactoryContext& context_;
-  std::unique_ptr<NetworkPolicyMapImpl> impl_;
+  std::shared_ptr<NetworkPolicyMapImpl> impl_;
 };
 using NetworkPolicyMapSharedPtr = std::shared_ptr<const NetworkPolicyMap>;
 

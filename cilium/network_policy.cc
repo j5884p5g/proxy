@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -36,7 +37,6 @@
 
 #include "source/common/common/assert.h"
 #include "source/common/common/logger.h"
-#include "source/common/common/macros.h"
 #include "source/common/common/matchers.h"
 #include "source/common/common/thread.h"
 #include "source/common/http/header_utility.h"
@@ -44,6 +44,7 @@
 #include "source/common/init/target_impl.h"
 #include "source/common/init/watcher_impl.h"
 #include "source/common/network/utility.h"
+#include "source/common/protobuf/message_validator_impl.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
 #include "source/server/transport_socket_config_impl.h"
@@ -57,11 +58,13 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/variant.h"
 #include "cilium/accesslog.h"
 #include "cilium/api/npds.pb.h"
 #include "cilium/grpc_subscription.h"
 #include "cilium/ipcache.h"
 #include "cilium/secret_watcher.h"
+#include "cilium/versioned.h"
 
 namespace Envoy {
 namespace Cilium {
@@ -111,20 +114,265 @@ template <> struct formatter<Envoy::Cilium::RuleVerdict> {
 namespace Envoy {
 namespace Cilium {
 
+// A specific version of a selector used in a policy. Each update yields a new instance.
+class SelectorInstance : public VersionedNode<SelectorInstance>,
+                         public absl::flat_hash_set<uint32_t> {};
+
+// Read-only series of specific selector insteances.
+class NamedSelectorReadable : public VersionedReadable<SelectorInstance> {
+public:
+  explicit NamedSelectorReadable(const std::string& name) : name_(name) {}
+
+  const std::string& name() const { return name_; }
+
+private:
+  std::string name_;
+};
+
+// Stable handle on a read-only selector for accessing specific versions of the selector.
+using SelectorHandle = std::shared_ptr<const NamedSelectorReadable>;
+
+// Writable series of selector versions for main-thread updates
+class NamedSelectorValue : public VersionedValue<SelectorInstance, NamedSelectorReadable> {
+public:
+  explicit NamedSelectorValue(const std::string& name)
+      : VersionedValue<SelectorInstance, NamedSelectorReadable>(name) {}
+};
+
+// Map of named selectors, keyed with xDS resource name
+class SelectorMap : public VersionedMap<std::string, SelectorInstance, NamedSelectorValue> {
+public:
+  using VersionedMap<std::string, SelectorInstance, NamedSelectorValue>::VersionedMap;
+};
+
 class PolicyInstanceImpl;
 
+// Stable policy map, usually keyed with endpoint IP (IPv4 and IPv6).
 using PolicyMapSnapshot =
     absl::flat_hash_map<std::string, std::shared_ptr<const PolicyInstanceImpl>>;
 
-class NetworkPolicyMapImpl : public Envoy::Config::SubscriptionCallbacks,
-                             public Logger::Loggable<Logger::Id::config> {
+// variant wrapper for supported resource map keys for delta policy updates
+// Delta xDS refers to removed resources by resource name, so we must have a map to
+// locate the policy/selector to be removed.
+class ResourceKey {
 public:
-  NetworkPolicyMapImpl(Server::Configuration::FactoryContext& context);
+  struct PolicyResourceEntry {
+    std::shared_ptr<const PolicyInstanceImpl> policy;
+  };
+
+  struct PolicyEndpointIpEntry {};
+
+  struct SelectorResourceEntry {
+    SelectorHandle handle;
+  };
+
+  static ResourceKey policyResource(const std::shared_ptr<const PolicyInstanceImpl>& policy) {
+    return ResourceKey(PolicyResourceEntry{policy});
+  }
+
+  static ResourceKey policyEndpointIp() { return ResourceKey(PolicyEndpointIpEntry{}); }
+
+  static ResourceKey selectorResource(const SelectorHandle& handle) {
+    return ResourceKey(SelectorResourceEntry{handle});
+  }
+
+  const PolicyResourceEntry* policyResourceEntry() const {
+    return absl::get_if<PolicyResourceEntry>(&value_);
+  }
+
+  const SelectorResourceEntry* selectorResourceEntry() const {
+    return absl::get_if<SelectorResourceEntry>(&value_);
+  }
+
+  bool isPolicyEndpointIpEntry() const {
+    return absl::holds_alternative<PolicyEndpointIpEntry>(value_);
+  }
+
+private:
+  explicit ResourceKey(const PolicyResourceEntry& value) : value_(value) {}
+  explicit ResourceKey(const PolicyEndpointIpEntry& value) : value_(value) {}
+  explicit ResourceKey(const SelectorResourceEntry& value) : value_(value) {}
+
+  absl::variant<PolicyResourceEntry, PolicyEndpointIpEntry, SelectorResourceEntry> value_;
+};
+
+// Map of Delta xDS resources for name collision and duplicate name detection.
+class ResourceMap : public absl::flat_hash_map<std::string, ResourceKey> {
+public:
+  using absl::flat_hash_map<std::string, ResourceKey>::flat_hash_map;
+
+  const ResourceKey* findEntry(const std::string& key) const {
+    auto it = find(key);
+    return it != end() ? &it->second : nullptr;
+  }
+
+  void replaceWith(std::vector<std::pair<std::string, ResourceKey>>&& entries) {
+    clear();
+    reserve(entries.size());
+    for (auto& [key, value] : entries) {
+      insert_or_assign(std::move(key), std::move(value));
+    }
+  }
+
+  void erasePolicyResource(PolicyMapSnapshot& policy_map, const std::string& resource_name,
+                           const std::shared_ptr<const PolicyInstanceImpl>& policy);
+};
+
+// ResourceMapOverlay lets delta updates stage tentative resource-map removals and insertions on top
+// of the current ResourceMap while validation is still in progress. This preserves transactional
+// behavior without copying the full map: failed updates can be discarded cheaply, and successful
+// ones are applied to the real map only after the whole update has been accepted.
+class ResourceMapOverlay {
+public:
+  ResourceMapOverlay() = default;
+  explicit ResourceMapOverlay(const ResourceMap& base) : base_(&base) {}
+
+  const ResourceKey* findEntry(const std::string& key) const {
+    auto upsert_it = upserts_.find(key);
+    if (upsert_it != upserts_.end()) {
+      return &upsert_it->second;
+    }
+    if (removed_.contains(key)) {
+      return nullptr;
+    }
+    return base_ ? base_->findEntry(key) : nullptr;
+  }
+
+  SelectorHandle getSelectorHandleOrThrow(const std::string& selector) const {
+    const auto* entry = findEntry(selector);
+    if (entry == nullptr) {
+      throw EnvoyException(fmt::format(
+          "Delta Network Policy rule references missing selector resource '{}'", selector));
+    }
+    const auto* selector_entry = entry->selectorResourceEntry();
+    if (selector_entry == nullptr || selector_entry->handle == nullptr) {
+      throw EnvoyException(
+          fmt::format("Delta Network Policy rule references non-selector resource '{}'", selector));
+    }
+    return selector_entry->handle;
+  }
+
+  bool emplace(std::string key, ResourceKey value) {
+    if (findEntry(key)) {
+      return false;
+    }
+    removed_.erase(key);
+    return upserts_.emplace(std::move(key), std::move(value)).second;
+  }
+
+  void insertOrAssign(std::string key, ResourceKey value) {
+    removed_.erase(key);
+    upserts_.insert_or_assign(std::move(key), std::move(value));
+  }
+
+  void erase(const std::string& key) {
+    upserts_.erase(key);
+    if (base_ && base_->find(key) != base_->end()) {
+      removed_.insert(key);
+    } else {
+      removed_.erase(key);
+    }
+  }
+
+  bool eraseSelectorResourceIfPresent(const std::string& key) {
+    const auto* entry = findEntry(key);
+    if (entry == nullptr || entry->selectorResourceEntry() == nullptr) {
+      return false;
+    }
+    erase(key);
+    return true;
+  }
+
+  bool erasePolicyResourceIfPresent(PolicyMapSnapshot& policy_map,
+                                    const std::string& resource_name) {
+    const auto* entry = findEntry(resource_name);
+    if (entry == nullptr) {
+      return false;
+    }
+    const auto* policy_entry = entry->policyResourceEntry();
+    if (policy_entry == nullptr) {
+      return false;
+    }
+    erasePolicyResource(policy_map, resource_name, policy_entry->policy);
+    return true;
+  }
+
+  void erasePolicyResource(PolicyMapSnapshot& policy_map, const std::string& resource_name,
+                           const std::shared_ptr<const PolicyInstanceImpl>& policy);
+
+  void applyTo(ResourceMap& map) && {
+    if (!upserts_.empty()) {
+      map.reserve(map.size() + upserts_.size());
+    }
+    for (const auto& key : removed_) {
+      map.erase(key);
+    }
+    for (auto& [key, value] : upserts_) {
+      map.insert_or_assign(std::move(key), std::move(value));
+    }
+  }
+
+private:
+  const ResourceMap* base_{};
+  absl::flat_hash_set<std::string> removed_;
+  absl::flat_hash_map<std::string, ResourceKey> upserts_;
+};
+
+// helper for validating resource names.
+void validateResourceNameHasNoWhitespace(absl::string_view resource_name,
+                                         absl::string_view subject) {
+  if (std::ranges::any_of(resource_name, [](unsigned char c) { return absl::ascii_isspace(c); })) {
+    throw EnvoyException(
+        fmt::format("{} '{}' must not contain whitespace", subject, resource_name));
+  }
+}
+
+// PolicyStreamState is shared by all policies created from one accepted NPDS stream generation.
+// Same-stream selector-only updates publish a newer selector version into this object so existing
+// policies follow immediately. When the NPDS stream restarts, new policies get a fresh state
+// object while old policies keep the old one until the old policy map has quiesced and been
+// retired. This allows the new stream to reuse selector resource names so that the xDS server
+// need not keep selector resource names in stable storage accross restarts.
+class PolicyStreamState {
+public:
+  explicit PolicyStreamState(uint64_t stream_generation, SelectorVersion version = versionMin)
+      : stream_generation_(stream_generation), version_(version) {}
+
+  uint64_t streamGeneration() const { return stream_generation_; }
+
+  SelectorVersion version() const { return version_.load(std::memory_order_acquire); }
+
+  void publishVersion(SelectorVersion version) {
+    version_.store(version, std::memory_order_release);
+  }
+
+private:
+  const uint64_t stream_generation_;
+  std::atomic<SelectorVersion> version_;
+};
+using PolicyStreamStateSharedPtr = std::shared_ptr<PolicyStreamState>;
+using PolicyStreamStateConstSharedPtr = std::shared_ptr<const PolicyStreamState>;
+
+class NetworkPolicyMapImpl : public Envoy::Config::SubscriptionCallbacks,
+                             public Logger::Loggable<Logger::Id::config>,
+                             public std::enable_shared_from_this<NetworkPolicyMapImpl> {
+public:
+  friend class PortNetworkPolicyRule;
+  NetworkPolicyMapImpl(Server::Configuration::FactoryContext& context, bool use_delta_xds);
   ~NetworkPolicyMapImpl() override;
 
   void startSubscription() {
-    subscription_ = subscribe("type.googleapis.com/cilium.NetworkPolicy", context_,
-                              *npds_stats_scope_, *this, std::make_shared<NetworkPolicyDecoder>());
+    if (use_delta_xds_) {
+      subscription_ = subscribe("type.googleapis.com/cilium.NetworkPolicyResource", context_,
+                                *npds_stats_scope_, *this,
+                                std::make_shared<NetworkPolicyResourceDecoder>(
+                                    ProtobufMessage::getNullValidationVisitor(), "name"),
+                                use_delta_xds_);
+    } else {
+      subscription_ =
+          subscribe("type.googleapis.com/cilium.NetworkPolicy", context_, *npds_stats_scope_, *this,
+                    std::make_shared<NetworkPolicyDecoder>(), use_delta_xds_);
+    }
   }
 
   // This is used for testing with a file-based subscription
@@ -137,13 +385,7 @@ public:
                               const std::string& version_info) override;
   absl::Status onConfigUpdate(const std::vector<Envoy::Config::DecodedResourceRef>& added_resources,
                               const Protobuf::RepeatedPtrField<std::string>& removed_resources,
-                              const std::string& system_version_info) override {
-    // NOT IMPLEMENTED YET.
-    UNREFERENCED_PARAMETER(added_resources);
-    UNREFERENCED_PARAMETER(removed_resources);
-    UNREFERENCED_PARAMETER(system_version_info);
-    return absl::OkStatus();
-  }
+                              const std::string& system_version_info) override;
   void onConfigUpdateFailed(Envoy::Config::ConfigUpdateFailureReason,
                             const EnvoyException* e) override;
 
@@ -155,10 +397,15 @@ public:
 
   void tlsWrapperMissingPolicyInc() const { stats_.tls_wrapper_missing_policy_.inc(); }
 
-protected:
-  uint64_t streamGeneration() const { return grpcStreamGeneration(subscription_.get()); }
+  bool useDeltaXds() const { return use_delta_xds_; }
 
-  void resetStreamForTest() { applied_stream_generation_ = 0; }
+protected:
+  uint64_t streamGeneration() const {
+    return stream_generation_override_for_test_ != 0 ? stream_generation_override_for_test_
+                                                     : grpcStreamGeneration(subscription_.get());
+  }
+
+  void resetStreamForTest() { stream_generation_override_for_test_ = streamGeneration() + 1; }
 
   // run the given function after all the threads have scheduled
   void runAfterAllThreads(std::function<void()> cb) const {
@@ -169,18 +416,20 @@ protected:
     context_.threadLocal().runOnAllWorkerThreads([]() {}, cb);
   }
 
-  std::string resourceName(const cilium::NetworkPolicy& config) {
-    return fmt::format("{}", config.endpoint_id());
-  }
-
   void reopenIpcache();
 
   std::shared_ptr<const PolicyInstanceImpl>
-  createOrReusePolicy(const cilium::NetworkPolicy& config, const PolicyMapSnapshot& old_policy_map);
+  createOrReusePolicy(const std::string& resource_name, const cilium::NetworkPolicy& config,
+                      const PolicyStreamStateConstSharedPtr& policy_stream_state,
+                      const ResourceMap& old_resource_map,
+                      const ResourceMapOverlay* selector_resource_map);
+
+  SelectorHandle createOrReuseSelector(const std::string& resource_name,
+                                       const cilium::Selector& config, uint64_t update_version);
 
   void installNewPolicyMap(PolicyMapSnapshot&& new_policy_map,
                            Init::ManagerImpl& version_init_manager, std::string&& version_name,
-                           uint64_t stream_generation);
+                           const PolicyStreamStateSharedPtr& policy_stream_state);
 
 private:
   // Helpers for atomic swap of the policy map pointer.
@@ -222,12 +471,28 @@ private:
   }
 
   const PolicyInstance* getPolicyInstanceImpl(const std::string& endpoint_policy_name) const;
+  PolicyInstanceConstSharedPtr
+  getPolicyInstanceSharedImpl(const std::string& endpoint_policy_name) const;
+  uint64_t policySelectorStreamGenerationForTestImpl(const PolicyInstance& policy) const;
+  SelectorVersion policySelectorVersionForTestImpl(const PolicyInstance& policy) const;
   void removeInitManager();
+  void scheduleSelectorDeferredDeletion(DeferredDeletion<SelectorInstance>&& deferred);
+  void scheduleSelectorGCAndDeferredDeletion(uint64_t published_version,
+                                             const PolicyMapSnapshot* old_policy_map = nullptr);
 
   static uint64_t instance_id_;
 
+  const bool use_delta_xds_;
   Server::Configuration::ServerFactoryContext& context_;
+
   std::atomic<const PolicyMapSnapshot*> map_ptr_;
+  SelectorMap selector_map_;
+  // Policies hold a shared per-stream state object. A freshly installed stream stores its actual
+  // gRPC stream generation here, so same-stream selector-only updates advance existing policies
+  // immediately while old policies remain pinned to the latest selector version reached by their
+  // own stream.
+  PolicyStreamStateSharedPtr policy_stream_state_{std::make_shared<PolicyStreamState>(0)};
+  ResourceMap resource_map_;
   Stats::ScopeSharedPtr npds_stats_scope_;
   Stats::ScopeSharedPtr policy_stats_scope_;
 
@@ -237,10 +502,9 @@ private:
       transport_factory_context_;
 
   std::unique_ptr<Envoy::Config::Subscription> subscription_;
-  // Value 0 is reserved for detection of the initial stream before the first
-  // successful policy install. Tracked gRPC subscriptions may also report 0
-  // before any stream has been established.
-  uint64_t applied_stream_generation_{0};
+  // Test-only override used to simulate a restarted NPDS stream when the test subscription does
+  // not expose a new underlying gRPC stream generation.
+  uint64_t stream_generation_override_for_test_{0};
 
   ProtobufTypes::MessagePtr dumpNetworkPolicyConfigs(const Matchers::StringMatcher& name_matcher);
   Server::ConfigTracker::EntryOwnerPtr config_tracker_entry_;
@@ -252,6 +516,10 @@ protected:
 };
 
 uint64_t NetworkPolicyMapImpl::instance_id_ = 0;
+
+namespace {
+constexpr absl::string_view WildcardResourceName = "*";
+} // namespace
 
 IpAddressPair::IpAddressPair(const cilium::NetworkPolicy& proto) {
   for (const auto& ip_addr : proto.endpoint_ips()) {
@@ -615,22 +883,38 @@ public:
         tier_last_precedence_(0), pass_index_(0), l7_proto_("") {}
 
   PortNetworkPolicyRule(const NetworkPolicyMapImpl& parent,
-                        const cilium::PortNetworkPolicyRule& rule)
+                        const cilium::PortNetworkPolicyRule& rule,
+                        const ResourceMapOverlay* selector_resource_map)
       : name_(rule.name()),
         verdict_(rule.pass_precedence() ? RuleVerdict::Pass
                                         : (rule.deny() ? RuleVerdict::Deny : RuleVerdict::Allow)),
         proxy_id_(uint16_t(rule.proxy_id())), precedence_(rule.precedence()),
-        tier_last_precedence_(rule.pass_precedence()), pass_index_(0),
-        l7_proto_(rule.l7_proto()) {
+        tier_last_precedence_(rule.pass_precedence()), pass_index_(0), l7_proto_(rule.l7_proto()) {
     if (tier_last_precedence_ > precedence_) {
       throw EnvoyException(
           fmt::format("PortNetworkPolicyRule: pass_precedence {} must be lower than precedence {}",
                       tier_last_precedence_, precedence_));
     }
-    for (const auto& remote : rule.remote_policies()) {
-      ENVOY_LOG(trace, "Cilium L7 PortNetworkPolicyRule(): {} remote {} by rule: {}", verdict_,
-                remote, name_);
-      remotes_.emplace(remote);
+    if (selector_resource_map) {
+      if (rule.remote_policies_size()) {
+        throw EnvoyException(
+            "Delta Network Policy rule must use selectors instead of remote_policies");
+      }
+      selectors_.reserve(rule.selectors_size());
+      for (const auto& selector : rule.selectors()) {
+        ENVOY_LOG(trace, "Cilium L7 PortNetworkPolicyRule(): {} selector {} by rule: {}", verdict_,
+                  selector, name_);
+        selectors_.emplace_back(selector_resource_map->getSelectorHandleOrThrow(selector));
+      }
+    } else {
+      if (rule.selectors_size()) {
+        throw EnvoyException("State-of-the-world Network Policy rule must not use selectors");
+      }
+      for (const auto remote : rule.remote_policies()) {
+        ENVOY_LOG(trace, "Cilium L7 PortNetworkPolicyRule(): {} remote {} by rule: {}", verdict_,
+                  remote, name_);
+        remotes_.emplace(remote);
+      }
     }
     if (rule.has_downstream_tls_context()) {
       auto config = rule.downstream_tls_context();
@@ -667,29 +951,41 @@ public:
     }
   }
 
-  // inheritpassprecedence bumps up the precedence of a rule in a lower tier to the precedence
-  // range reserved right after the precedence of the given pass rule.
-  void inheritPassPrecedence(const PortNetworkPolicyRule& pass_rule) {
-    precedence_ -= pass_rule.tier_last_precedence_;
-    precedence_ += pass_rule.precedence_;
+  bool isRemoteWildcard() const { return remotes_.empty() && selectors_.empty(); }
+
+  bool matchesRemoteId(uint32_t remote_id, const SelectorVersion selector_version) const {
+    if (isRemoteWildcard()) {
+      return true;
+    }
+    if (!remotes_.empty()) {
+      return remotes_.contains(remote_id);
+    }
+
+    for (const auto& selector : selectors_) {
+      const auto resolved_selector = selector->get(selector_version);
+      if (resolved_selector && resolved_selector->contains(remote_id)) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  bool isRemoteWildcard() const { return remotes_.empty(); }
-
-  RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id) const {
+  RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id,
+                         const SelectorVersion selector_version) const {
     // proxy_id must match if we have any.
     if (proxy_id_ && proxy_id != proxy_id_) {
       return RuleVerdict::None;
     }
     // Remote ID must match if we have any.
-    if (!isRemoteWildcard() && !remotes_.contains(remote_id)) {
+    if (!matchesRemoteId(remote_id, selector_version)) {
       return RuleVerdict::None; // no verdict
     }
     ASSERT(verdict_ != RuleVerdict::None, "rule must have a verdict");
     return verdict_;
   }
 
-  RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id, absl::string_view sni) const {
+  RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id, absl::string_view sni,
+                         const SelectorVersion selector_version) const {
     // sni must match if we have any
     if (!allowed_snis_.empty() &&
         (sni.empty() || std::ranges::none_of(allowed_snis_, [&](const auto& pattern) {
@@ -697,13 +993,14 @@ public:
          }))) {
       return RuleVerdict::None;
     }
-    return getVerdict(proxy_id, remote_id);
+    return getVerdict(proxy_id, remote_id, selector_version);
   }
 
   RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id,
                          Envoy::Http::RequestHeaderMap& headers,
-                         Cilium::AccessLog::Entry& log_entry) const {
-    auto verdict = getVerdict(proxy_id, remote_id);
+                         Cilium::AccessLog::Entry& log_entry,
+                         const SelectorVersion selector_version) const {
+    auto verdict = getVerdict(proxy_id, remote_id, selector_version);
     if (!hasHttpRules() || verdict != RuleVerdict::Allow) {
       return verdict;
     }
@@ -727,8 +1024,9 @@ public:
     return (header_matched) ? RuleVerdict::Allow : RuleVerdict::None;
   }
 
-  RuleVerdict useProxylib(uint16_t proxy_id, uint32_t remote_id, std::string& l7_proto) const {
-    auto verdict = getVerdict(proxy_id, remote_id);
+  RuleVerdict useProxylib(uint16_t proxy_id, uint32_t remote_id, std::string& l7_proto,
+                          const SelectorVersion selector_version) const {
+    auto verdict = getVerdict(proxy_id, remote_id, selector_version);
     if (verdict != RuleVerdict::Allow) {
       return verdict;
     }
@@ -743,8 +1041,9 @@ public:
 
   // Envoy Metadata matcher, called after deny has already been checked for
   RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id,
-                         const envoy::config::core::v3::Metadata& metadata) const {
-    auto verdict = getVerdict(proxy_id, remote_id);
+                         const envoy::config::core::v3::Metadata& metadata,
+                         const SelectorVersion selector_version) const {
+    auto verdict = getVerdict(proxy_id, remote_id, selector_version);
     if (verdict != RuleVerdict::Allow) {
       return verdict;
     }
@@ -795,8 +1094,18 @@ public:
   }
 
   void toString(int indent, std::string& res) const {
-    res.append(indent - 2, ' ').append("- remotes: [");
-    res.append(fmt::format("{}", fmt::join(remotes_, ",")));
+    if (!selectors_.empty()) {
+      res.append(indent - 2, ' ').append("- selectors: [");
+      std::vector<std::string> quoted_selectors;
+      quoted_selectors.reserve(selectors_.size());
+      for (const auto& selector : selectors_) {
+        quoted_selectors.emplace_back(fmt::format("\"{}\"", selector->name()));
+      }
+      res.append(fmt::format("{}", fmt::join(quoted_selectors, ",")));
+    } else {
+      res.append(indent - 2, ' ').append("- remotes: [");
+      res.append(fmt::format("{}", fmt::join(remotes_, ",")));
+    }
     res.append("]\n");
 
     if (!name_.empty()) {
@@ -861,9 +1170,10 @@ public:
   const RuleVerdict verdict_;
   const uint16_t proxy_id_;
   uint32_t precedence_;
-  uint32_t tier_last_precedence_;
+  const uint32_t tier_last_precedence_;
   uint32_t pass_index_;
   absl::btree_set<uint32_t> remotes_;
+  std::vector<SelectorHandle> selectors_;
 
   std::vector<SniPattern> allowed_snis_; // All SNIs allowed if empty.
   std::shared_ptr<std::vector<HttpNetworkPolicyRule>>
@@ -917,13 +1227,15 @@ public:
   // First call marks 'rules_' as initialized. Of further calls, if either is empty,
   // we must add a default allow rule to retain the semantics of empty rules.
   void append(const NetworkPolicyMapImpl& parent,
-              const Protobuf::RepeatedPtrField<cilium::PortNetworkPolicyRule>& rules) {
+              const Protobuf::RepeatedPtrField<cilium::PortNetworkPolicyRule>& rules,
+              const ResourceMapOverlay* selector_resource_map) {
     if (initialized_ && rules.empty() != rules_.empty()) {
       // add an explicit allow-all rule to keep the combined semantics
       addDefaultAllowRule();
     }
     for (const auto& it : rules) {
-      rules_.emplace_back(std::make_shared<PortNetworkPolicyRule>(parent, it));
+      rules_.emplace_back(
+          std::make_shared<PortNetworkPolicyRule>(parent, it, selector_resource_map));
       updateFor(rules_.back());
     }
     initialized_ = true;
@@ -933,14 +1245,15 @@ public:
   // First call marks 'rules_' as initialized. Of further calls, if either is empty,
   // we must add a default allow rule to retain the semantics of an empty rules.
   void prepend(const NetworkPolicyMapImpl& parent,
-               const Protobuf::RepeatedPtrField<cilium::PortNetworkPolicyRule>& rules) {
+               const Protobuf::RepeatedPtrField<cilium::PortNetworkPolicyRule>& rules,
+               const ResourceMapOverlay* selector_resource_map) {
     if (initialized_ && rules.empty() != rules_.empty()) {
       // add an explicit allow-all rule to keep the combined semantics
       rules_.emplace(rules_.begin(), std::make_shared<PortNetworkPolicyRule>());
     }
     for (const auto& it : rules) {
       rules_.emplace(rules_.begin(),
-                     std::make_shared<PortNetworkPolicyRule>(parent, it));
+                     std::make_shared<PortNetworkPolicyRule>(parent, it, selector_resource_map));
       updateFor(rules_.front());
     }
     initialized_ = true;
@@ -951,7 +1264,6 @@ public:
   // we must add a default allow rule to retain the semantics of the combined rules.
   void appendRules(const std::vector<PortNetworkPolicyRuleConstSharedPtr>& rules) {
     if (initialized_ && rules.empty() != rules_.empty()) {
-      // add an explicit allow-all rule to keep the combined semantics
       addDefaultAllowRule();
     }
     for (auto& rule : rules) {
@@ -1114,9 +1426,10 @@ public:
 
   RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id,
                          Envoy::Http::RequestHeaderMap& headers,
-                         Cilium::AccessLog::Entry& log_entry) const {
+                         Cilium::AccessLog::Entry& log_entry,
+                         const SelectorVersion selector_version) const {
     auto verdict = forEachRule(can_short_circuit_, [&](const auto& rule) {
-      return rule.getVerdict(proxy_id, remote_id, headers, log_entry);
+      return rule.getVerdict(proxy_id, remote_id, headers, log_entry, selector_version);
     });
 
     ENVOY_LOG(trace,
@@ -1125,24 +1438,30 @@ public:
     return verdict;
   }
 
-  RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id, absl::string_view sni) const {
-    auto verdict = forEachRule(
-        true, [&](const auto& rule) { return rule.getVerdict(proxy_id, remote_id, sni); });
+  RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id, absl::string_view sni,
+                         const SelectorVersion selector_version) const {
+    auto verdict = forEachRule(true, [&](const auto& rule) {
+      return rule.getVerdict(proxy_id, remote_id, sni, selector_version);
+    });
 
     ENVOY_LOG(trace, "Cilium L7 PortNetworkPolicyRules(proxy_id: {}, remote_id: {}, sni: {}): {}",
               proxy_id, remote_id, sni, verdict);
     return verdict;
   }
 
-  RuleVerdict useProxylib(uint16_t proxy_id, uint32_t remote_id, std::string& l7_proto) const {
-    return forEachRule(
-        true, [&](const auto& rule) { return rule.useProxylib(proxy_id, remote_id, l7_proto); });
+  RuleVerdict useProxylib(uint16_t proxy_id, uint32_t remote_id, std::string& l7_proto,
+                          const SelectorVersion selector_version) const {
+    return forEachRule(true, [&](const auto& rule) {
+      return rule.useProxylib(proxy_id, remote_id, l7_proto, selector_version);
+    });
   }
 
   RuleVerdict getVerdict(uint16_t proxy_id, uint32_t remote_id,
-                         const envoy::config::core::v3::Metadata& metadata) const {
-    auto verdict = forEachRule(
-        true, [&](const auto& rule) { return rule.getVerdict(proxy_id, remote_id, metadata); });
+                         const envoy::config::core::v3::Metadata& metadata,
+                         const SelectorVersion selector_version) const {
+    auto verdict = forEachRule(true, [&](const auto& rule) {
+      return rule.getVerdict(proxy_id, remote_id, metadata, selector_version);
+    });
 
     ENVOY_LOG(trace,
               "Cilium L7 PortNetworkPolicyRules(proxy_id: {}, remote_id: {}, metadata: {}): {}",
@@ -1152,20 +1471,24 @@ public:
   }
 
   RuleVerdict getServerTlsContext(uint16_t proxy_id, uint32_t remote_id, absl::string_view sni,
-                                  Ssl::ContextSharedPtr& tls_ctx,
-                                  const Ssl::ContextConfig*& config) const {
+                                  Ssl::ContextSharedPtr& tls_ctx, const Ssl::ContextConfig*& config,
+                                  const SelectorVersion selector_version) const {
     tls_ctx = nullptr;
     return forEachRulePred(
-        [&](const auto& rule) { return rule.getVerdict(proxy_id, remote_id, sni); },
+        [&](const auto& rule) {
+          return rule.getVerdict(proxy_id, remote_id, sni, selector_version);
+        },
         [&](const auto& rule) { return rule.getServerTlsContext(tls_ctx, config); });
   }
 
   RuleVerdict getClientTlsContext(uint16_t proxy_id, uint32_t remote_id, absl::string_view sni,
-                                  Ssl::ContextSharedPtr& tls_ctx,
-                                  const Ssl::ContextConfig*& config) const {
+                                  Ssl::ContextSharedPtr& tls_ctx, const Ssl::ContextConfig*& config,
+                                  const SelectorVersion selector_version) const {
     tls_ctx = nullptr;
     return forEachRulePred(
-        [&](const auto& rule) { return rule.getVerdict(proxy_id, remote_id, sni); },
+        [&](const auto& rule) {
+          return rule.getVerdict(proxy_id, remote_id, sni, selector_version);
+        },
         [&](const auto& rule) { return rule.getClientTlsContext(tls_ctx, config); });
   }
 
@@ -1246,13 +1569,14 @@ const PortNetworkPolicyRules* findPortRules(const PolicySnapshot& map, uint16_t 
 
 } // namespace
 
-PortPolicy::PortPolicy(const PolicySnapshot& map, uint16_t port)
+PortPolicy::PortPolicy(const PolicySnapshot& map, uint16_t port, SelectorVersion selector_version)
     : port_rules_(findPortRules(map, port)),
-      has_http_rules_(port_rules_ && port_rules_->hasHttpRules()) {}
+      has_http_rules_(port_rules_ && port_rules_->hasHttpRules()),
+      selector_version_(selector_version) {}
 
 bool PortPolicy::useProxylib(uint16_t proxy_id, uint32_t remote_id, std::string& l7_proto) const {
   if (port_rules_) {
-    auto verdict = port_rules_->useProxylib(proxy_id, remote_id, l7_proto);
+    auto verdict = port_rules_->useProxylib(proxy_id, remote_id, l7_proto, selector_version_);
     if (verdict == RuleVerdict::Allow) {
       return true;
     }
@@ -1272,14 +1596,15 @@ bool PortPolicy::allowed(uint16_t proxy_id, uint32_t remote_id,
   if (!port_rules_) {
     return false;
   }
-  return port_rules_->getVerdict(proxy_id, remote_id, headers, log_entry) == RuleVerdict::Allow;
+  return port_rules_->getVerdict(proxy_id, remote_id, headers, log_entry, selector_version_) ==
+         RuleVerdict::Allow;
 }
 
 bool PortPolicy::allowed(uint16_t proxy_id, uint32_t remote_id, absl::string_view sni) const {
   if (!port_rules_) {
     return false;
   }
-  return port_rules_->getVerdict(proxy_id, remote_id, sni) == RuleVerdict::Allow;
+  return port_rules_->getVerdict(proxy_id, remote_id, sni, selector_version_) == RuleVerdict::Allow;
 }
 
 bool PortPolicy::allowed(uint16_t proxy_id, uint32_t remote_id,
@@ -1287,7 +1612,8 @@ bool PortPolicy::allowed(uint16_t proxy_id, uint32_t remote_id,
   if (!port_rules_) {
     return false;
   }
-  return port_rules_->getVerdict(proxy_id, remote_id, metadata) == RuleVerdict::Allow;
+  return port_rules_->getVerdict(proxy_id, remote_id, metadata, selector_version_) ==
+         RuleVerdict::Allow;
 }
 
 Ssl::ContextSharedPtr PortPolicy::getServerTlsContext(uint16_t proxy_id, uint32_t remote_id,
@@ -1299,7 +1625,8 @@ Ssl::ContextSharedPtr PortPolicy::getServerTlsContext(uint16_t proxy_id, uint32_
   config = nullptr;
   raw_socket_allowed = false;
   if (port_rules_) {
-    auto verdict = port_rules_->getServerTlsContext(proxy_id, remote_id, sni, tls_ctx, config);
+    auto verdict = port_rules_->getServerTlsContext(proxy_id, remote_id, sni, tls_ctx, config,
+                                                    selector_version_);
     raw_socket_allowed = verdict == RuleVerdict::Allow && tls_ctx == nullptr && config == nullptr;
   }
   return tls_ctx;
@@ -1314,7 +1641,8 @@ Ssl::ContextSharedPtr PortPolicy::getClientTlsContext(uint16_t proxy_id, uint32_
   config = nullptr;
   raw_socket_allowed = false;
   if (port_rules_) {
-    auto verdict = port_rules_->getClientTlsContext(proxy_id, remote_id, sni, tls_ctx, config);
+    auto verdict = port_rules_->getClientTlsContext(proxy_id, remote_id, sni, tls_ctx, config,
+                                                    selector_version_);
     raw_socket_allowed = verdict == RuleVerdict::Allow && tls_ctx == nullptr && config == nullptr;
   }
   return tls_ctx;
@@ -1331,7 +1659,8 @@ bool inline rangesOverlap(const PortRange& a, const PortRange& b) {
 class PortNetworkPolicy : public Logger::Loggable<Logger::Id::config> {
 public:
   PortNetworkPolicy(const NetworkPolicyMapImpl& parent,
-                    const Protobuf::RepeatedPtrField<cilium::PortNetworkPolicy>& rules) {
+                    const Protobuf::RepeatedPtrField<cilium::PortNetworkPolicy>& rules,
+                    const ResourceMapOverlay* selector_resource_map) {
     for (const auto& rule : rules) {
       // Only TCP supported for HTTP
       if (rule.protocol() == envoy::config::core::v3::SocketAddress::TCP) {
@@ -1490,10 +1819,10 @@ public:
             // so the relative order of rules from this batch is reversed. This
             // is harmless: equal-precedence rules are evaluated as alternatives
             // (stable sort only affects presentation/debug ordering).
-            rules.prepend(parent, rule.rules());
+            rules.prepend(parent, rule.rules(), selector_resource_map);
           } else {
             // Rules with a non-trivial range go to the back of the list
-            rules.append(parent, rule.rules());
+            rules.append(parent, rule.rules(), selector_resource_map);
           }
         }
       } else {
@@ -1545,7 +1874,9 @@ public:
     }
   }
 
-  const PortPolicy findPortPolicy(uint16_t port) const { return PortPolicy(rules_, port); }
+  const PortPolicy findPortPolicy(uint16_t port, const SelectorVersion selector_version) const {
+    return PortPolicy(rules_, port, selector_version);
+  }
 
   void toString(int indent, std::string& res) const {
     if (rules_.empty()) {
@@ -1568,11 +1899,15 @@ public:
 // methods.
 class PolicyInstanceImpl : public PolicyInstance {
 public:
+  friend class NetworkPolicyMapImpl;
   PolicyInstanceImpl(const NetworkPolicyMapImpl& parent, uint64_t hash,
-                     const cilium::NetworkPolicy& proto)
+                     const cilium::NetworkPolicy& proto,
+                     const PolicyStreamStateConstSharedPtr& policy_stream_state,
+                     const ResourceMapOverlay* selector_resource_map)
       : endpoint_id_(proto.endpoint_id()), hash_(hash), policy_proto_(proto), endpoint_ips_(proto),
-        parent_(parent), ingress_(parent, policy_proto_.ingress_per_port_policies()),
-        egress_(parent, policy_proto_.egress_per_port_policies()) {}
+        parent_(parent), policy_stream_state_(policy_stream_state),
+        ingress_(parent, policy_proto_.ingress_per_port_policies(), selector_resource_map),
+        egress_(parent, policy_proto_.egress_per_port_policies(), selector_resource_map) {}
 
   bool allowed(bool ingress, uint16_t proxy_id, uint32_t remote_id, uint16_t port,
                Envoy::Http::RequestHeaderMap& headers,
@@ -1591,7 +1926,9 @@ public:
   }
 
   const PortPolicy findPortPolicy(bool ingress, uint16_t port) const override {
-    return ingress ? ingress_.findPortPolicy(port) : egress_.findPortPolicy(port);
+    const auto selector_version = policy_stream_state_->version();
+    return ingress ? ingress_.findPortPolicy(port, selector_version)
+                   : egress_.findPortPolicy(port, selector_version);
   }
 
   bool useProxylib(bool ingress, uint16_t proxy_id, uint32_t remote_id, uint16_t port,
@@ -1623,15 +1960,59 @@ public:
 
 private:
   const NetworkPolicyMapImpl& parent_;
+  const PolicyStreamStateConstSharedPtr policy_stream_state_;
   const PortNetworkPolicy ingress_;
   const PortNetworkPolicy egress_;
 };
 
+void ResourceMap::erasePolicyResource(PolicyMapSnapshot& policy_map,
+                                      const std::string& resource_name,
+                                      const std::shared_ptr<const PolicyInstanceImpl>& policy) {
+  ASSERT(policy != nullptr, "policy resource key must carry a policy");
+  for (const auto& endpoint_ip : policy->policy_proto_.endpoint_ips()) {
+    policy_map.erase(endpoint_ip);
+    erase(endpoint_ip);
+  }
+  erase(resource_name);
+}
+
+void ResourceMapOverlay::erasePolicyResource(
+    PolicyMapSnapshot& policy_map, const std::string& resource_name,
+    const std::shared_ptr<const PolicyInstanceImpl>& policy) {
+  ASSERT(policy != nullptr, "policy resource key must carry a policy");
+  for (const auto& endpoint_ip : policy->policy_proto_.endpoint_ips()) {
+    policy_map.erase(endpoint_ip);
+    erase(endpoint_ip);
+  }
+  erase(resource_name);
+}
+
+namespace {
+
+bool policyUsesSelectors(const cilium::NetworkPolicy& policy) {
+  for (const auto& port_policy : policy.ingress_per_port_policies()) {
+    if (std::ranges::any_of(port_policy.rules(),
+                            [](const auto& rule) { return rule.selectors_size() > 0; })) {
+      return true;
+    }
+  }
+  for (const auto& port_policy : policy.egress_per_port_policies()) {
+    if (std::ranges::any_of(port_policy.rules(),
+                            [](const auto& rule) { return rule.selectors_size() > 0; })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
+
 // Common base constructor
 // This is used directly for testing with a file-based subscription
-NetworkPolicyMap::NetworkPolicyMap(Server::Configuration::FactoryContext& context, bool subscribe)
+NetworkPolicyMap::NetworkPolicyMap(Server::Configuration::FactoryContext& context, bool subscribe,
+                                   bool use_delta_xds)
     : context_(context.serverFactoryContext()) {
-  impl_ = std::make_unique<NetworkPolicyMapImpl>(context);
+  impl_ = std::make_shared<NetworkPolicyMapImpl>(context, use_delta_xds);
 
   if (subscribe) {
     impl_->startSubscription();
@@ -1658,8 +2039,10 @@ NetworkPolicyMap::~NetworkPolicyMap() {
 }
 
 bool NetworkPolicyMap::exists(const std::string& endpoint_policy_name) const {
-  return impl_->getPolicyInstanceImpl(endpoint_policy_name) != nullptr;
+  return impl_->getPolicyInstanceImpl(endpoint_policy_name);
 }
+
+bool NetworkPolicyMap::useDeltaXds() const { return impl_->useDeltaXds(); }
 
 void NetworkPolicyMap::startSubscriptionForTest(
     std::unique_ptr<Envoy::Config::Subscription>&& subscription) {
@@ -1672,13 +2055,36 @@ Envoy::Config::SubscriptionCallbacks& NetworkPolicyMap::subscriptionCallbacksFor
 
 PolicyStats& NetworkPolicyMap::statsForTest() const { return impl_->stats_; }
 
-NetworkPolicyMapImpl::NetworkPolicyMapImpl(Server::Configuration::FactoryContext& context)
-    : context_(context.serverFactoryContext()), map_ptr_(nullptr),
+void NetworkPolicyMap::resetStreamForTest() { impl_->resetStreamForTest(); }
+
+PolicyInstanceConstSharedPtr
+NetworkPolicyMap::getPolicyInstanceSharedForTest(const std::string& endpoint_policy_name) const {
+  return impl_->getPolicyInstanceSharedImpl(endpoint_policy_name);
+}
+
+uint64_t
+NetworkPolicyMap::policySelectorStreamGenerationForTest(const PolicyInstance& policy) const {
+  return impl_->policySelectorStreamGenerationForTestImpl(policy);
+}
+
+SelectorVersion NetworkPolicyMap::policySelectorVersionForTest(const PolicyInstance& policy) const {
+  return impl_->policySelectorVersionForTestImpl(policy);
+}
+
+NetworkPolicyMapImpl::NetworkPolicyMapImpl(Server::Configuration::FactoryContext& context,
+                                           bool use_delta_xds)
+    : use_delta_xds_(use_delta_xds), context_(context.serverFactoryContext()), map_ptr_(nullptr),
       npds_stats_scope_(context_.serverScope().createScope("cilium.npds.")),
       policy_stats_scope_(context_.serverScope().createScope("cilium.policy.")),
       init_target_(fmt::format("Cilium Network Policy subscription start"),
                    [this]() {
-                     subscription_->start({});
+                     if (use_delta_xds_) {
+                       // NPDS always wants all resources, so use an explicit wildcard subscription
+                       // in delta xDS.
+                       subscription_->start({std::string(WildcardResourceName)});
+                     } else {
+                       subscription_->start({});
+                     }
                      // Allow listener init to continue before network policy updates are received
                      init_target_.ready();
                    }),
@@ -1717,49 +2123,87 @@ void NetworkPolicyMapImpl::reopenIpcache() {
   // Cilium agent re-creates IP cache on restart, and the first accepted update on
   // the new stream must reopen it before workers enforce refreshed identities.
   IpCacheSharedPtr ipcache = IpCache::getIpCache(context_);
-  if (ipcache != nullptr) {
+  if (ipcache) {
     ENVOY_LOG(info, "Reopening ipcache on new stream");
     ipcache->open();
   }
 }
 
-std::shared_ptr<const PolicyInstanceImpl>
-NetworkPolicyMapImpl::createOrReusePolicy(const cilium::NetworkPolicy& config,
-                                          const PolicyMapSnapshot& old_policy_map) {
+std::shared_ptr<const PolicyInstanceImpl> NetworkPolicyMapImpl::createOrReusePolicy(
+    const std::string& resource_name, const cilium::NetworkPolicy& config,
+    const PolicyStreamStateConstSharedPtr& policy_stream_state, const ResourceMap& old_resource_map,
+    const ResourceMapOverlay* selector_resource_map) {
   const uint64_t new_hash = MessageUtil::hash(config);
-  auto policy_it = old_policy_map.find(config.endpoint_ips()[0]);
-  if (policy_it != old_policy_map.cend()) {
-    const auto& old_policy = policy_it->second;
+  auto it = old_resource_map.find(resource_name);
+  if (it != old_resource_map.cend()) {
+    const auto* old_policy_entry = it->second.policyResourceEntry();
+    if (old_policy_entry == nullptr) {
+      return std::make_shared<const PolicyInstanceImpl>(*this, new_hash, config,
+                                                        policy_stream_state, selector_resource_map);
+    }
+    const auto& old_policy = old_policy_entry->policy;
     if (old_policy && old_policy->hash_ == new_hash &&
-        Protobuf::util::MessageDifferencer::Equals(old_policy->policy_proto_, config)) {
+        Protobuf::util::MessageDifferencer::Equals(old_policy->policy_proto_, config) &&
+        !(selector_resource_map && policyUsesSelectors(config))) {
       ENVOY_LOG(trace, "New policy is equal to old one, not updating.");
       return old_policy;
     }
   }
 
-  // May throw
-  return std::make_shared<const PolicyInstanceImpl>(*this, new_hash, config);
+  return std::make_shared<const PolicyInstanceImpl>(*this, new_hash, config, policy_stream_state,
+                                                    selector_resource_map);
 }
 
-void NetworkPolicyMapImpl::installNewPolicyMap(PolicyMapSnapshot&& new_policy_map,
-                                               Init::ManagerImpl& version_init_manager,
-                                               std::string&& version_name,
-                                               uint64_t stream_generation) {
+SelectorHandle NetworkPolicyMapImpl::createOrReuseSelector(const std::string& resource_name,
+                                                           const cilium::Selector& config,
+                                                           uint64_t update_version) {
+  // Compare against the selector visible in the currently prepared update version, not just the
+  // last published one. Under the single-update-in-flight VersionedMap contract, any selector
+  // visible in 'update_version' is also the indefinite selector value for that candidate update.
+  auto selector_value = selector_map_.find(resource_name);
+  if (selector_value) {
+    const auto* old_selector = selector_value->get(update_version);
+    if (old_selector &&
+        old_selector->size() == static_cast<size_t>(config.remote_identities_size()) &&
+        std::ranges::all_of(config.remote_identities(), [&](const auto remote_identity) {
+          return old_selector->contains(remote_identity);
+        })) {
+      return selector_value;
+    }
+  }
+
+  // otherwise create a new one and insert it to the selector map.
+
+  auto selector = new SelectorInstance();
+  selector->reserve(config.remote_identities_size());
+  for (const auto remote_identity : config.remote_identities()) {
+    selector->emplace(remote_identity);
+  }
+  return selector_map_.insert(resource_name, selector);
+}
+
+void NetworkPolicyMapImpl::installNewPolicyMap(
+    PolicyMapSnapshot&& new_policy_map, Init::ManagerImpl& version_init_manager,
+    std::string&& version_name, const PolicyStreamStateSharedPtr& policy_stream_state) {
   // Initialize SDS secrets. We do not wait for the completion.
   version_init_manager.initialize(Init::WatcherImpl(std::move(version_name), []() {}));
 
-  const auto* old_policy_map = exchange(new PolicyMapSnapshot(std::move(new_policy_map)));
+  auto new_policy_map_ptr = std::make_unique<PolicyMapSnapshot>(std::move(new_policy_map));
+  // Publish selector data before publishing the new policy map. New policies created above already
+  // point at 'policy_stream_state', so any worker that can observe the swapped-in policy map must
+  // also be able to observe the selector version those policies expect to use.
+  auto new_version = selector_map_.publishNextVersion();
+  if (new_version > 0) {
+    policy_stream_state->publishVersion(new_version);
+  }
+  policy_stream_state_ = policy_stream_state;
 
-  // Record stream state only after a successful install. The reserved value 0
-  // keeps the initial accepted update on any stream source classified as new.
-  applied_stream_generation_ = stream_generation;
+  // old version can be GC'd once all worker threads have quiesced
+  const auto* old_policy_map = exchange(new_policy_map_ptr.release());
 
-  // Delete the old map once all worker threads have entered their event queues, as this
-  // is proof that they no longer refer to the old map.
-  runAfterAllThreads([old_policy_map]() {
-    // Clean-up in the main thread after all threads have scheduled
-    delete old_policy_map;
-  });
+  // Delete the old map and first-phase GC old selector versions once all worker threads have
+  // entered their event queues, as this is proof that they no longer refer to the old map.
+  scheduleSelectorGCAndDeferredDeletion(new_version, old_policy_map);
 }
 
 // removeInitManager must be called at the end of each policy update
@@ -1775,6 +2219,35 @@ void NetworkPolicyMapImpl::removeInitManager() {
 #endif
 }
 
+void NetworkPolicyMapImpl::scheduleSelectorDeferredDeletion(
+    DeferredDeletion<SelectorInstance>&& deferred) {
+  if (deferred.empty()) {
+    return;
+  }
+  auto deferred_owner = std::make_shared<DeferredDeletion<SelectorInstance>>(std::move(deferred));
+  // The callback exists only to keep the deferred-deletion batch alive until all workers have
+  // quiesced once more. The batch deletes its nodes from the closure destructor.
+  runAfterAllThreads([deferred_owner]() {});
+}
+
+void NetworkPolicyMapImpl::scheduleSelectorGCAndDeferredDeletion(
+    uint64_t published_version, const PolicyMapSnapshot* old_policy_map) {
+  if (published_version == 0 && old_policy_map == nullptr) {
+    return;
+  }
+  runAfterAllThreads([shared_this = shared_from_this(), published_version, old_policy_map]() {
+    // Clean-up in the main thread after all worker threads have scheduled.
+    // Delete the old policy map before selector GC. Old policies are the only remaining users of
+    // old-stream selector versions; once the old map is gone after this quiescence point, those
+    // selector versions may be unlinked and deferred for deletion.
+    delete old_policy_map;
+    if (published_version == 0) {
+      return;
+    }
+    shared_this->scheduleSelectorDeferredDeletion(shared_this->selector_map_.gc(published_version));
+  });
+}
+
 // onConfigUpdate parses the new network policy resources, allocates a new policy map and atomically
 // swaps it in place of the old policy map. Throws if any of the 'resources' can not be
 // parsed. Otherwise an OK status is returned without pausing NPDS gRPC stream, causing a new
@@ -1783,7 +2256,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     const std::vector<Envoy::Config::DecodedResourceRef>& resources,
     const std::string& version_info) {
   auto stream_generation = streamGeneration();
-  const bool is_new_stream = stream_generation != applied_stream_generation_;
+  const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
   ENVOY_LOG(debug, "NetworkPolicyMapImpl::onConfigUpdate({}), {} resources, version: {}",
             instance_id_, resources.size(), version_info);
   stats_.updates_total_.inc();
@@ -1805,11 +2278,18 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   // SDS secrets will use this!
   transport_factory_context_->setInitManager(version_init_manager);
 
-  const auto* old_policy_map = load();
+  const auto& old_resource_map = resource_map_;
+  const auto policy_stream_state =
+      is_new_stream
+          ? std::make_shared<PolicyStreamState>(stream_generation, selector_map_.getVersion())
+          : policy_stream_state_;
   PolicyMapSnapshot new_policy_map;
+  std::vector<std::pair<std::string, ResourceKey>> resource_entries;
   try {
     for (const auto& resource : resources) {
       const auto& config = dynamic_cast<const cilium::NetworkPolicy&>(resource.get().resource());
+      const std::string& resource_name = resource.get().name();
+      validateResourceNameHasNoWhitespace(resource_name, "Network Policy resource name");
       if (config.endpoint_ips().empty()) {
         throw EnvoyException("Network Policy has no endpoint ips");
       }
@@ -1818,11 +2298,16 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
                 "version {}",
                 config.endpoint_id(), config.endpoint_ips()[0], version_info);
 
-      auto policy = createOrReusePolicy(config, *old_policy_map);
+      auto policy = createOrReusePolicy(resource_name, config, policy_stream_state,
+                                        old_resource_map, nullptr);
+      if (!resource_name.empty()) {
+        resource_entries.emplace_back(resource_name, ResourceKey::policyResource(policy));
+      }
       for (const auto& endpoint_ip : config.endpoint_ips()) {
         ENVOY_LOG(trace, "Cilium updating or keeping network policy for endpoint {}", endpoint_ip);
         // new_policy_map is not exception safe, policy must be computed separately!
-        new_policy_map.emplace(endpoint_ip, policy);
+        new_policy_map.insert_or_assign(endpoint_ip, policy);
+        resource_entries.emplace_back(endpoint_ip, ResourceKey::policyEndpointIp());
       }
     }
   } catch (const EnvoyException& e) {
@@ -1834,7 +2319,290 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   removeInitManager();
 
   installNewPolicyMap(std::move(new_policy_map), version_init_manager, std::move(version_name),
-                      stream_generation);
+                      policy_stream_state);
+  resource_map_.replaceWith(std::move(resource_entries));
+
+  return absl::OkStatus();
+}
+
+absl::Status NetworkPolicyMapImpl::onConfigUpdate(
+    const std::vector<Envoy::Config::DecodedResourceRef>& added_resources,
+    const Protobuf::RepeatedPtrField<std::string>& removed_resources,
+    const std::string& system_version_info) {
+  auto stream_generation = streamGeneration();
+  const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
+  const auto& old_resource_map = resource_map_;
+  bool updates_policies = false;
+  bool updates_selectors = false;
+  for (const auto& removed_resource : removed_resources) {
+    validateResourceNameHasNoWhitespace(removed_resource,
+                                        "Network Policy delta removed resource name");
+    auto resource_it = old_resource_map.find(removed_resource);
+    if (resource_it == old_resource_map.end()) {
+      continue;
+    }
+    if (resource_it->second.selectorResourceEntry()) {
+      updates_selectors = true;
+    } else {
+      updates_policies = true;
+    }
+  }
+  for (const auto& resource : added_resources) {
+    const auto& typed_resource =
+        dynamic_cast<const cilium::NetworkPolicyResource&>(resource.get().resource());
+    const std::string& resource_name = resource.get().name();
+    if (resource_name.empty()) {
+      throw EnvoyException("Network Policy delta resource has no name");
+    }
+    validateResourceNameHasNoWhitespace(resource_name, "Network Policy delta resource name");
+    switch (typed_resource.resource_case()) {
+    case cilium::NetworkPolicyResource::kPolicy:
+      updates_policies = true;
+      break;
+    case cilium::NetworkPolicyResource::kSelector:
+      updates_selectors = true;
+      break;
+    case cilium::NetworkPolicyResource::RESOURCE_NOT_SET:
+      break;
+    }
+  }
+  ENVOY_LOG(debug,
+            "NetworkPolicyMapImpl::onConfigUpdate({}), {} added resources, {} removed resources, "
+            "version: {}, updates_selectors: {}, updates_policies: {}",
+            instance_id_, added_resources.size(), removed_resources.size(), system_version_info,
+            updates_selectors, updates_policies);
+  stats_.updates_total_.inc();
+
+  // Reopen IPcache for every new stream. Cilium agent re-creates IP cache on restart,
+  // and that is also when the old stream terminates and a new one is created.
+  // New security identities (e.g., for FQDN policies) only get inserted to the new IP cache,
+  // so open it before the workers get a chance to enforce policy on the new IDs.
+  if (is_new_stream) {
+    ENVOY_LOG(info, "New NetworkPolicy stream");
+    reopenIpcache();
+  }
+  removeInitManager();
+
+  if (!is_new_stream && updates_selectors && !updates_policies) {
+    ResourceMapOverlay pending_resource_map(resource_map_);
+
+    try {
+      const auto selector_update_version = selector_map_.prepareNextVersion();
+
+      for (const auto& removed_resource : removed_resources) {
+        ENVOY_LOG(trace, "Cilium removing network policy resource {}", removed_resource);
+        const auto* resource_entry = pending_resource_map.findEntry(removed_resource);
+        if (resource_entry == nullptr) {
+          continue;
+        }
+        if (resource_entry->isPolicyEndpointIpEntry()) {
+          throw EnvoyException(fmt::format(
+              "Network Policy delta removed resource '{}' is a policy endpoint IP alias, "
+              "not a resource name",
+              removed_resource));
+        }
+        if (resource_entry->policyResourceEntry()) {
+          throw EnvoyException(
+              fmt::format("Network Policy delta removed resource '{}' refers to a policy resource",
+                          removed_resource));
+        }
+        selector_map_.clear(removed_resource);
+        pending_resource_map.erase(removed_resource);
+      }
+
+      for (const auto& resource : added_resources) {
+        const auto& typed_resource =
+            dynamic_cast<const cilium::NetworkPolicyResource&>(resource.get().resource());
+        if (typed_resource.resource_case() != cilium::NetworkPolicyResource::kSelector) {
+          continue;
+        }
+        const std::string& resource_name = resource.get().name();
+        pending_resource_map.eraseSelectorResourceIfPresent(resource_name);
+      }
+
+      for (const auto& resource : added_resources) {
+        const auto& typed_resource =
+            dynamic_cast<const cilium::NetworkPolicyResource&>(resource.get().resource());
+        const std::string& resource_name = resource.get().name();
+
+        switch (typed_resource.resource_case()) {
+        case cilium::NetworkPolicyResource::kSelector: {
+          ENVOY_LOG(debug,
+                    "Received delta Network Policy selector resource {} in onConfigUpdate() "
+                    "version {}",
+                    resource_name, system_version_info);
+          auto selector_handle = createOrReuseSelector(resource_name, typed_resource.selector(),
+                                                       selector_update_version);
+          if (!pending_resource_map.emplace(resource_name,
+                                            ResourceKey::selectorResource(selector_handle))) {
+            throw EnvoyException(fmt::format(
+                "Network Policy delta update has duplicate resource key '{}'", resource_name));
+          }
+          break;
+        }
+        case cilium::NetworkPolicyResource::kPolicy:
+          IS_ENVOY_BUG("Selector-only delta Network Policy update unexpectedly included a policy");
+          break;
+        case cilium::NetworkPolicyResource::RESOURCE_NOT_SET:
+          throw EnvoyException("Network Policy delta resource has no payload");
+        }
+      }
+    } catch (const EnvoyException& e) {
+      ENVOY_LOG(warn, "NetworkPolicy delta update for version {} failed: {}", system_version_info,
+                e.what());
+      stats_.updates_rejected_.inc();
+      scheduleSelectorDeferredDeletion(selector_map_.revert());
+      throw; // re-throw
+    }
+
+    // Same-stream selector-only updates become visible to existing policies by first publishing the
+    // selector version itself and only then publishing that version number through the shared
+    // stream state. Reversing this order would let workers observe a selector version that has not
+    // yet been published in the selector map.
+    auto new_version = selector_map_.publishNextVersion();
+    if (new_version > 0) {
+      policy_stream_state_->publishVersion(new_version);
+      scheduleSelectorGCAndDeferredDeletion(new_version);
+    }
+    std::move(pending_resource_map).applyTo(resource_map_);
+    return absl::OkStatus();
+  }
+
+  std::string version_name = fmt::format("NetworkPolicyMap version {}", system_version_info);
+  Init::ManagerImpl version_init_manager(version_name);
+  transport_factory_context_->setInitManager(version_init_manager);
+
+  const auto* old_policy_map = load();
+  PolicyMapSnapshot new_policy_map = is_new_stream ? PolicyMapSnapshot{} : *old_policy_map;
+  ResourceMapOverlay pending_resource_map =
+      is_new_stream ? ResourceMapOverlay() : ResourceMapOverlay(resource_map_);
+  const auto policy_stream_state =
+      is_new_stream
+          ? std::make_shared<PolicyStreamState>(stream_generation, selector_map_.getVersion())
+          : policy_stream_state_;
+  try {
+    const auto selector_update_version = selector_map_.prepareNextVersion();
+
+    for (const auto& removed_resource : removed_resources) {
+      ENVOY_LOG(trace, "Cilium removing network policy resource {}", removed_resource);
+      const auto* resource_entry = pending_resource_map.findEntry(removed_resource);
+      if (resource_entry == nullptr) {
+        continue;
+      }
+      if (resource_entry->selectorResourceEntry()) {
+        selector_map_.clear(removed_resource);
+        pending_resource_map.erase(removed_resource);
+        continue;
+      }
+      if (pending_resource_map.erasePolicyResourceIfPresent(new_policy_map, removed_resource)) {
+        continue;
+      }
+      throw EnvoyException(
+          fmt::format("Network Policy delta removed resource '{}' is a policy endpoint IP alias, "
+                      "not a resource name",
+                      removed_resource));
+    }
+
+    for (const auto& resource : added_resources) {
+      const auto& typed_resource =
+          dynamic_cast<const cilium::NetworkPolicyResource&>(resource.get().resource());
+      const std::string& resource_name = resource.get().name();
+      const auto* resource_entry = pending_resource_map.findEntry(resource_name);
+      if (resource_entry == nullptr) {
+        continue;
+      }
+
+      switch (typed_resource.resource_case()) {
+      case cilium::NetworkPolicyResource::kSelector:
+        pending_resource_map.eraseSelectorResourceIfPresent(resource_name);
+        break;
+      case cilium::NetworkPolicyResource::kPolicy:
+        pending_resource_map.erasePolicyResourceIfPresent(new_policy_map, resource_name);
+        break;
+      case cilium::NetworkPolicyResource::RESOURCE_NOT_SET:
+        break;
+      }
+    }
+
+    for (const auto& resource : added_resources) {
+      const auto& typed_resource =
+          dynamic_cast<const cilium::NetworkPolicyResource&>(resource.get().resource());
+      const std::string& resource_name = resource.get().name();
+
+      if (typed_resource.resource_case() != cilium::NetworkPolicyResource::kSelector) {
+        continue;
+      }
+
+      ENVOY_LOG(debug,
+                "Received delta Network Policy selector resource {} in onConfigUpdate() "
+                "version {}",
+                resource_name, system_version_info);
+      auto selector_handle =
+          createOrReuseSelector(resource_name, typed_resource.selector(), selector_update_version);
+      if (!pending_resource_map.emplace(resource_name,
+                                        ResourceKey::selectorResource(selector_handle))) {
+        throw EnvoyException(fmt::format(
+            "Network Policy delta update has duplicate resource key '{}'", resource_name));
+      }
+    }
+
+    for (const auto& resource : added_resources) {
+      const auto& typed_resource =
+          dynamic_cast<const cilium::NetworkPolicyResource&>(resource.get().resource());
+      const std::string& resource_name = resource.get().name();
+
+      switch (typed_resource.resource_case()) {
+      case cilium::NetworkPolicyResource::kSelector:
+        break;
+      case cilium::NetworkPolicyResource::kPolicy: {
+        const auto& config = typed_resource.policy();
+        if (config.endpoint_ips().empty()) {
+          throw EnvoyException("Network Policy has no endpoint ips");
+        }
+        if (config.endpoint_id() == 0) {
+          throw EnvoyException("Network Policy endpoint_id must be non-zero");
+        }
+        ENVOY_LOG(debug,
+                  "Received delta Network Policy resource {} for endpoint {}, endpoint_ip {} in "
+                  "onConfigUpdate() version {}",
+                  resource_name, config.endpoint_id(), config.endpoint_ips()[0],
+                  system_version_info);
+
+        auto policy = createOrReusePolicy(resource_name, config, policy_stream_state,
+                                          old_resource_map, &pending_resource_map);
+        if (!pending_resource_map.emplace(resource_name, ResourceKey::policyResource(policy))) {
+          throw EnvoyException(fmt::format(
+              "Network Policy delta update has duplicate resource key '{}'", resource_name));
+        }
+        for (const auto& endpoint_ip : config.endpoint_ips()) {
+          ENVOY_LOG(trace, "Cilium updating network policy for endpoint {}", endpoint_ip);
+          if (!pending_resource_map.emplace(endpoint_ip, ResourceKey::policyEndpointIp())) {
+            throw EnvoyException(fmt::format(
+                "Network Policy delta update has duplicate resource key '{}'", endpoint_ip));
+          }
+          if (!new_policy_map.emplace(endpoint_ip, policy).second) {
+            throw EnvoyException(fmt::format(
+                "Network Policy delta update has duplicate resource key '{}'", endpoint_ip));
+          }
+        }
+        break;
+      }
+      case cilium::NetworkPolicyResource::RESOURCE_NOT_SET:
+        throw EnvoyException("Network Policy delta resource has no payload");
+      }
+    }
+  } catch (const EnvoyException& e) {
+    ENVOY_LOG(warn, "NetworkPolicy delta update for version {} failed: {}", system_version_info,
+              e.what());
+    stats_.updates_rejected_.inc();
+    removeInitManager();
+    scheduleSelectorDeferredDeletion(selector_map_.revert());
+    throw; // re-throw
+  }
+  removeInitManager();
+  installNewPolicyMap(std::move(new_policy_map), version_init_manager, std::move(version_name),
+                      policy_stream_state);
+  std::move(pending_resource_map).applyTo(resource_map_);
 
   return absl::OkStatus();
 }
@@ -1887,7 +2655,7 @@ public:
   }
 
   const PortPolicy findPortPolicy(bool ingress, uint16_t) const override {
-    return ingress ? PortPolicy(empty_map_, 0) : PortPolicy(empty_map_, 1);
+    return ingress ? PortPolicy(empty_map_, 0, versionMin) : PortPolicy(empty_map_, 1, versionMin);
   }
 
   bool useProxylib(bool, uint16_t, uint32_t, uint16_t, std::string&) const override {
@@ -1930,7 +2698,7 @@ public:
   }
 
   const PortPolicy findPortPolicy(bool, uint16_t) const override {
-    return PortPolicy(empty_map_, 0);
+    return PortPolicy(empty_map_, 0, versionMin);
   }
 
   bool useProxylib(bool, uint16_t, uint32_t, uint16_t, std::string&) const override {
@@ -1968,6 +2736,32 @@ NetworkPolicyMapImpl::getPolicyInstanceImpl(const std::string& endpoint_ip) cons
   return nullptr;
 }
 
+PolicyInstanceConstSharedPtr
+NetworkPolicyMapImpl::getPolicyInstanceSharedImpl(const std::string& endpoint_ip) const {
+  const auto* map = load();
+  auto it = map->find(endpoint_ip);
+  if (it != map->end()) {
+    return it->second;
+  }
+  return nullptr;
+}
+
+uint64_t NetworkPolicyMapImpl::policySelectorStreamGenerationForTestImpl(
+    const PolicyInstance& policy) const {
+  if (const auto* policy_impl = dynamic_cast<const PolicyInstanceImpl*>(&policy)) {
+    return policy_impl->policy_stream_state_->streamGeneration();
+  }
+  return 0;
+}
+
+SelectorVersion
+NetworkPolicyMapImpl::policySelectorVersionForTestImpl(const PolicyInstance& policy) const {
+  if (const auto* policy_impl = dynamic_cast<const PolicyInstanceImpl*>(&policy)) {
+    return policy_impl->policy_stream_state_->version();
+  }
+  return versionMin;
+}
+
 // getPolicyInstance return a const reference to a policy in the policy map for the given
 // 'endpoint_ip'. If there is no policy for the given IP, a default policy is returned,
 // controlled by the 'default_allow_egress' argument as follows:
@@ -1982,9 +2776,7 @@ NetworkPolicyMapImpl::getPolicyInstanceImpl(const std::string& endpoint_ip) cons
 const PolicyInstance& NetworkPolicyMap::getPolicyInstance(const std::string& endpoint_ip,
                                                           bool default_allow_egress) const {
   const auto* policy = impl_->getPolicyInstanceImpl(endpoint_ip);
-  return policy != nullptr      ? *policy
-         : default_allow_egress ? getAllowAllEgressPolicy()
-                                : getDenyAllPolicy();
+  return policy ? *policy : default_allow_egress ? getAllowAllEgressPolicy() : getDenyAllPolicy();
 }
 
 } // namespace Cilium

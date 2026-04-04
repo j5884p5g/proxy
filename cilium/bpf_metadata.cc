@@ -260,8 +260,14 @@ Config::Config(const ::cilium::BpfMetadata& config,
   if (ipcache_ || hosts_) {
     npmap_ =
         context.serverFactoryContext().singletonManager().getTyped<const Cilium::NetworkPolicyMap>(
-            SINGLETON_MANAGER_REGISTERED_NAME(cilium_network_policy),
-            [&context] { return std::make_shared<Cilium::NetworkPolicyMap>(context, true); });
+            SINGLETON_MANAGER_REGISTERED_NAME(cilium_network_policy), [&context, &config] {
+              return std::make_shared<Cilium::NetworkPolicyMap>(context, true,
+                                                                config.use_delta_npds());
+            });
+    if (npmap_->useDeltaXds() != config.use_delta_npds()) {
+      throw EnvoyException(
+          "cilium.bpf_metadata: use_npds_delta must be consistent across listeners");
+    }
   }
 }
 
