@@ -20,6 +20,7 @@
 #include "source/common/network/utility.h"
 #include "source/common/protobuf/message_validator_impl.h"
 #include "source/common/protobuf/utility.h"
+#include "source/common/stats/isolated_store_impl.h"
 #include "source/common/thread_local/thread_local_impl.h"
 
 #include "test/integration/http_integration.h"
@@ -447,11 +448,12 @@ resources:
   std::string path = TestEnvironment::writeStringToFileForTest("host_map_success.yaml", config);
   envoy::service::discovery::v3::DiscoveryResponse message;
   ThreadLocal::InstanceImpl tls;
+  Stats::IsolatedStoreImpl scope;
   Cilium::PolicyHostDecoder host_decoder;
 
   THROW_IF_NOT_OK(MessageUtil::loadFromFile(
       path, message, ProtobufMessage::getNullValidationVisitor(), *api_.get()));
-  auto hmap = std::make_shared<Envoy::Cilium::PolicyHostMap>(tls);
+  auto hmap = std::make_shared<Envoy::Cilium::PolicyHostMap>(tls, scope);
   const auto decoded_resources =
       THROW_OR_RETURN_VALUE(Config::DecodedResourcesWrapper::create(
                                 host_decoder, message.resources(), message.version_info()),
