@@ -3,6 +3,7 @@
 #include <fmt/format.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -193,12 +194,16 @@ class NetworkPolicyMapImpl;
 
 class NetworkPolicyMap : public Singleton::Instance, public Logger::Loggable<Logger::Id::config> {
 public:
+  using SubscriptionFactoryForTest =
+      std::function<std::unique_ptr<Envoy::Config::Subscription>(bool use_delta_xds)>;
+
   NetworkPolicyMap(Server::Configuration::FactoryContext& context, bool subscribe = false,
                    bool use_delta_xds = false);
   ~NetworkPolicyMap() override;
 
   bool exists(const std::string& endpoint_policy_name) const;
   bool useDeltaXds() const;
+  void setUseDeltaXds(bool use_delta_xds) const;
 
   const PolicyInstance& getPolicyInstance(const std::string& endpoint_policy_name,
                                           bool allow_egress) const;
@@ -216,6 +221,12 @@ protected:
   uint64_t policySelectorStreamGenerationForTest(const PolicyInstance& policy) const;
   SelectorVersion policySelectorVersionForTest(const PolicyInstance& policy) const;
   void startSubscriptionForTest(std::unique_ptr<Envoy::Config::Subscription>&& subscription);
+  void startManagedSubscriptionForTest();
+  void setSubscriptionFactoryForTest(SubscriptionFactoryForTest factory);
+  void onSubscriptionConnectedForTest();
+  void onSubscriptionTransportCloseForTest();
+  bool subscriptionUseDeltaXdsForTest() const;
+  bool subscriptionConnectedForTest() const;
   Envoy::Config::SubscriptionCallbacks& subscriptionCallbacksForTest() const;
 
 private:

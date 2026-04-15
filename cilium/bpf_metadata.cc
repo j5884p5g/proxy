@@ -264,10 +264,7 @@ Config::Config(const ::cilium::BpfMetadata& config,
               return std::make_shared<Cilium::NetworkPolicyMap>(context, true,
                                                                 config.use_delta_npds());
             });
-    if (npmap_->useDeltaXds() != config.use_delta_npds()) {
-      throw EnvoyException(
-          "cilium.bpf_metadata: use_npds_delta must be consistent across listeners");
-    }
+    npmap_->setUseDeltaXds(config.use_delta_npds());
   }
 }
 

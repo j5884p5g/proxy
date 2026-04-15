@@ -3,10 +3,12 @@
 #include <gtest/gtest.h>
 #include <spdlog/common.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "envoy/common/exception.h"
 #include "envoy/config/core/v3/config_source.pb.h"
@@ -32,6 +34,7 @@
 #include "test/mocks/server/factory_context.h"
 #include "test/test_common/utility.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/strings/string_view.h"
 #include "cilium/accesslog.h"
 #include "cilium/network_policy.h"
@@ -50,6 +53,34 @@ namespace Cilium {
         init_manager.add(*secret_provider->initTarget());                                          \
         return secret_provider;                                                                    \
       }))
+
+namespace {
+
+struct FakeSubscriptionState {
+  int start_calls_{0};
+  std::vector<std::vector<std::string>> start_resources_;
+};
+
+class FakeSubscription : public Envoy::Config::Subscription {
+public:
+  explicit FakeSubscription(std::shared_ptr<FakeSubscriptionState> state)
+      : state_(std::move(state)) {}
+
+  void start(const absl::flat_hash_set<std::string>& resource_names) override {
+    ++state_->start_calls_;
+    auto& started = state_->start_resources_.emplace_back();
+    started.insert(started.end(), resource_names.begin(), resource_names.end());
+    std::sort(started.begin(), started.end());
+  }
+
+  void updateResourceInterest(const absl::flat_hash_set<std::string>&) override {}
+  void requestOnDemandUpdate(const absl::flat_hash_set<std::string>&) override {}
+
+private:
+  std::shared_ptr<FakeSubscriptionState> state_;
+};
+
+} // namespace
 
 class CiliumNetworkPolicyTest : public ::testing::Test {
 protected:
@@ -251,6 +282,18 @@ protected:
   }
 
   void resetStreamForTest() { policy_map_->resetStreamForTest(); }
+  bool configuredUseDeltaXds() const { return policy_map_->useDeltaXds(); }
+  void setUseDeltaXds(bool use_delta_xds) const { policy_map_->setUseDeltaXds(use_delta_xds); }
+  void startManagedSubscriptionForTest() { policy_map_->startManagedSubscriptionForTest(); }
+  void setSubscriptionFactoryForTest(NetworkPolicyMap::SubscriptionFactoryForTest factory) {
+    policy_map_->setSubscriptionFactoryForTest(std::move(factory));
+  }
+  void onSubscriptionConnectedForTest() { policy_map_->onSubscriptionConnectedForTest(); }
+  void onSubscriptionTransportCloseForTest() { policy_map_->onSubscriptionTransportCloseForTest(); }
+  bool subscriptionUseDeltaXdsForTest() const {
+    return policy_map_->subscriptionUseDeltaXdsForTest();
+  }
+  bool subscriptionConnectedForTest() const { return policy_map_->subscriptionConnectedForTest(); }
 
   NiceMock<Server::Configuration::MockFactoryContext> factory_context_;
   NiceMock<Secret::MockSecretManager> secret_manager_;
@@ -266,6 +309,116 @@ protected:
 
 TEST_F(CiliumNetworkPolicyTest, UpdatesRejectedStatName) {
   EXPECT_EQ("cilium.policy.updates_rejected", updatesRejectedStatName());
+}
+
+TEST_F(CiliumNetworkPolicyTest, ManagedSubscriptionColdStartUsesConfiguredSotwMode) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+
+  ASSERT_EQ(created_modes.size(), 1);
+  EXPECT_FALSE(created_modes.front());
+  EXPECT_FALSE(configuredUseDeltaXds());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  ASSERT_EQ(state->start_calls_, 1);
+  EXPECT_TRUE(state->start_resources_.front().empty());
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, ManagedSubscriptionColdStartUsesConfiguredDeltaMode) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+
+  ASSERT_EQ(created_modes.size(), 1);
+  EXPECT_TRUE(created_modes.front());
+  EXPECT_TRUE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  ASSERT_EQ(state->start_calls_, 1);
+  EXPECT_THAT(state->start_resources_.front(), testing::ElementsAre(std::string("*")));
+}
+
+TEST_F(CiliumNetworkPolicyTest, FlagFlipOnHealthySubscriptionWaitsForTransportClose) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+
+  setUseDeltaXds(true);
+
+  EXPECT_TRUE(configuredUseDeltaXds());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_TRUE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false));
+  EXPECT_EQ(state->start_calls_, 1);
+
+  onSubscriptionTransportCloseForTest();
+
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_THAT(state->start_resources_.back(), testing::ElementsAre(std::string("*")));
+}
+
+TEST_F(CiliumNetworkPolicyTest, FlagFlipWhileDisconnectedRecreatesImmediately) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  ASSERT_FALSE(subscriptionConnectedForTest());
+
+  setUseDeltaXds(true);
+
+  EXPECT_TRUE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_THAT(state->start_resources_.back(), testing::ElementsAre(std::string("*")));
+}
+
+TEST_F(CiliumNetworkPolicyTest, TransportCloseWithoutFlagFlipKeepsCurrentMode) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+
+  onSubscriptionTransportCloseForTest();
+
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false));
+  EXPECT_EQ(state->start_calls_, 1);
 }
 
 TEST_F(CiliumNetworkPolicyTest, EmptyPolicyUpdate) {

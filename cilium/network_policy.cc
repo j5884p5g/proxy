@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -353,6 +354,10 @@ private:
 using PolicyStreamStateSharedPtr = std::shared_ptr<PolicyStreamState>;
 using PolicyStreamStateConstSharedPtr = std::shared_ptr<const PolicyStreamState>;
 
+namespace {
+constexpr absl::string_view WildcardResourceName = "*";
+} // namespace
+
 class NetworkPolicyMapImpl : public Envoy::Config::SubscriptionCallbacks,
                              public Logger::Loggable<Logger::Id::config>,
                              public std::enable_shared_from_this<NetworkPolicyMapImpl> {
@@ -361,23 +366,13 @@ public:
   NetworkPolicyMapImpl(Server::Configuration::FactoryContext& context, bool use_delta_xds);
   ~NetworkPolicyMapImpl() override;
 
-  void startSubscription() {
-    if (use_delta_xds_) {
-      subscription_ = subscribe("type.googleapis.com/cilium.NetworkPolicyResource", context_,
-                                *npds_stats_scope_, *this,
-                                std::make_shared<NetworkPolicyResourceDecoder>(
-                                    ProtobufMessage::getNullValidationVisitor(), "name"),
-                                use_delta_xds_);
-    } else {
-      subscription_ =
-          subscribe("type.googleapis.com/cilium.NetworkPolicy", context_, *npds_stats_scope_, *this,
-                    std::make_shared<NetworkPolicyDecoder>(), use_delta_xds_);
-    }
-  }
+  void subscribe();
 
   // This is used for testing with a file-based subscription
-  void startSubscription(std::unique_ptr<Envoy::Config::Subscription>&& subscription) {
+  void subscribe(std::unique_ptr<Envoy::Config::Subscription>&& subscription) {
     subscription_ = std::move(subscription);
+    subscription_use_delta_xds_ = desired_use_delta_xds_;
+    subscription_connected_ = false;
   }
 
   // Config::SubscriptionCallbacks
@@ -397,7 +392,15 @@ public:
 
   void tlsWrapperMissingPolicyInc() const { stats_.tls_wrapper_missing_policy_.inc(); }
 
-  bool useDeltaXds() const { return use_delta_xds_; }
+  bool useDeltaXds() const { return desired_use_delta_xds_; }
+
+  void setUseDeltaXds(bool use_delta_xds) {
+    desired_use_delta_xds_ = use_delta_xds;
+    if (!subscription_connected_ && subscription_ != nullptr) {
+      subscription_connected_ = grpcStreamConnected(subscription_.get());
+    }
+    maybeRecreateSubscriptionInDesiredMode();
+  }
 
 protected:
   uint64_t streamGeneration() const {
@@ -432,6 +435,39 @@ protected:
                            const PolicyStreamStateSharedPtr& policy_stream_state);
 
 private:
+  void startSubscription() {
+    ASSERT(subscription_ != nullptr);
+    if (subscription_use_delta_xds_) {
+      // NPDS always wants all resources, so use an explicit wildcard subscription in delta xDS.
+      subscription_->start({std::string(WildcardResourceName)});
+    } else {
+      subscription_->start({});
+    }
+  }
+
+  void onSubscriptionTransportEstablished(uint64_t subscription_id) {
+    if (subscription_id != subscription_id_) {
+      return;
+    }
+    subscription_connected_ = true;
+  }
+
+  void onSubscriptionTransportClosed(uint64_t subscription_id) {
+    if (subscription_id != subscription_id_) {
+      return;
+    }
+    subscription_connected_ = false;
+    maybeRecreateSubscriptionInDesiredMode();
+  }
+
+  void maybeRecreateSubscriptionInDesiredMode() {
+    if (subscription_ == nullptr || subscription_connected_ ||
+        desired_use_delta_xds_ == subscription_use_delta_xds_) {
+      return;
+    }
+    subscribe();
+  }
+
   // Helpers for atomic swap of the policy map pointer.
   //
   // store() is only used for the initialization of the map during construction.
@@ -479,10 +515,25 @@ private:
   void scheduleSelectorDeferredDeletion(DeferredDeletion<SelectorInstance>&& deferred);
   void scheduleSelectorGCAndDeferredDeletion(uint64_t published_version,
                                              const PolicyMapSnapshot* old_policy_map = nullptr);
+  void startManagedSubscriptionForTest() {
+    subscription_should_start_ = true;
+    subscribe();
+  }
+  void setSubscriptionFactoryForTest(NetworkPolicyMap::SubscriptionFactoryForTest factory) {
+    subscription_factory_for_test_ = std::move(factory);
+  }
+  void onSubscriptionConnectedForTest() { onSubscriptionTransportEstablished(subscription_id_); }
+  void onSubscriptionTransportCloseForTest() { onSubscriptionTransportClosed(subscription_id_); }
+  bool subscriptionUseDeltaXdsForTest() const { return subscription_use_delta_xds_; }
+  bool subscriptionConnectedForTest() const { return subscription_connected_; }
 
   static uint64_t instance_id_;
 
-  const bool use_delta_xds_;
+  bool desired_use_delta_xds_;
+  bool subscription_use_delta_xds_;
+  bool subscription_connected_{false};
+  bool subscription_should_start_{false};
+  uint64_t subscription_id_{0};
   Server::Configuration::ServerFactoryContext& context_;
 
   std::atomic<const PolicyMapSnapshot*> map_ptr_;
@@ -502,6 +553,7 @@ private:
       transport_factory_context_;
 
   std::unique_ptr<Envoy::Config::Subscription> subscription_;
+  NetworkPolicyMap::SubscriptionFactoryForTest subscription_factory_for_test_;
   // Test-only override used to simulate a restarted NPDS stream when the test subscription does
   // not expose a new underlying gRPC stream generation.
   uint64_t stream_generation_override_for_test_{0};
@@ -516,10 +568,6 @@ protected:
 };
 
 uint64_t NetworkPolicyMapImpl::instance_id_ = 0;
-
-namespace {
-constexpr absl::string_view WildcardResourceName = "*";
-} // namespace
 
 IpAddressPair::IpAddressPair(const cilium::NetworkPolicy& proto) {
   for (const auto& ip_addr : proto.endpoint_ips()) {
@@ -2015,7 +2063,7 @@ NetworkPolicyMap::NetworkPolicyMap(Server::Configuration::FactoryContext& contex
   impl_ = std::make_shared<NetworkPolicyMapImpl>(context, use_delta_xds);
 
   if (subscribe) {
-    impl_->startSubscription();
+    impl_->subscribe();
   }
 }
 
@@ -2043,10 +2091,35 @@ bool NetworkPolicyMap::exists(const std::string& endpoint_policy_name) const {
 }
 
 bool NetworkPolicyMap::useDeltaXds() const { return impl_->useDeltaXds(); }
+void NetworkPolicyMap::setUseDeltaXds(bool use_delta_xds) const {
+  impl_->setUseDeltaXds(use_delta_xds);
+}
 
 void NetworkPolicyMap::startSubscriptionForTest(
     std::unique_ptr<Envoy::Config::Subscription>&& subscription) {
-  impl_->startSubscription(std::move(subscription));
+  impl_->subscribe(std::move(subscription));
+}
+
+void NetworkPolicyMap::startManagedSubscriptionForTest() {
+  impl_->startManagedSubscriptionForTest();
+}
+
+void NetworkPolicyMap::setSubscriptionFactoryForTest(SubscriptionFactoryForTest factory) {
+  impl_->setSubscriptionFactoryForTest(std::move(factory));
+}
+
+void NetworkPolicyMap::onSubscriptionConnectedForTest() { impl_->onSubscriptionConnectedForTest(); }
+
+void NetworkPolicyMap::onSubscriptionTransportCloseForTest() {
+  impl_->onSubscriptionTransportCloseForTest();
+}
+
+bool NetworkPolicyMap::subscriptionUseDeltaXdsForTest() const {
+  return impl_->subscriptionUseDeltaXdsForTest();
+}
+
+bool NetworkPolicyMap::subscriptionConnectedForTest() const {
+  return impl_->subscriptionConnectedForTest();
 }
 
 Envoy::Config::SubscriptionCallbacks& NetworkPolicyMap::subscriptionCallbacksForTest() const {
@@ -2073,18 +2146,15 @@ SelectorVersion NetworkPolicyMap::policySelectorVersionForTest(const PolicyInsta
 
 NetworkPolicyMapImpl::NetworkPolicyMapImpl(Server::Configuration::FactoryContext& context,
                                            bool use_delta_xds)
-    : use_delta_xds_(use_delta_xds), context_(context.serverFactoryContext()), map_ptr_(nullptr),
+    : desired_use_delta_xds_(use_delta_xds), subscription_use_delta_xds_(use_delta_xds),
+      context_(context.serverFactoryContext()), map_ptr_(nullptr),
       npds_stats_scope_(context_.serverScope().createScope("cilium.npds.")),
       policy_stats_scope_(context_.serverScope().createScope("cilium.policy.")),
       init_target_(fmt::format("Cilium Network Policy subscription start"),
                    [this]() {
-                     if (use_delta_xds_) {
-                       // NPDS always wants all resources, so use an explicit wildcard subscription
-                       // in delta xDS.
-                       subscription_->start({std::string(WildcardResourceName)});
-                     } else {
-                       subscription_->start({});
-                     }
+                     // production subscription is allowed to start from now on
+                     subscription_should_start_ = true;
+                     startSubscription();
                      // Allow listener init to continue before network policy updates are received
                      init_target_.ready();
                    }),
@@ -2116,6 +2186,50 @@ NetworkPolicyMapImpl::~NetworkPolicyMapImpl() {
   ENVOY_LOG(debug, "Cilium L7 NetworkPolicyMapImpl({}): NetworkPolicyMap is deleted NOW!",
             instance_id_);
   delete load();
+}
+
+void NetworkPolicyMapImpl::subscribe() {
+  subscription_connected_ = false;
+  subscription_use_delta_xds_ = desired_use_delta_xds_;
+  ++subscription_id_;
+
+  if (subscription_factory_for_test_) {
+    subscription_ = subscription_factory_for_test_(subscription_use_delta_xds_);
+    if (subscription_should_start_) {
+      startSubscription();
+    }
+    return;
+  }
+
+  auto on_transport_close = [weak_this = weak_from_this(), id = subscription_id_]() {
+    if (auto shared_this = weak_this.lock()) {
+      shared_this->onSubscriptionTransportClosed(id);
+    }
+  };
+  auto on_transport_established = [weak_this = weak_from_this(), id = subscription_id_]() {
+    if (auto shared_this = weak_this.lock()) {
+      shared_this->onSubscriptionTransportEstablished(id);
+    }
+  };
+
+  if (subscription_use_delta_xds_) {
+    subscription_ = Cilium::subscribe(
+        "type.googleapis.com/cilium.NetworkPolicyResource", context_, *npds_stats_scope_, *this,
+        std::make_shared<NetworkPolicyResourceDecoder>(ProtobufMessage::getNullValidationVisitor(),
+                                                       "name"),
+        subscription_use_delta_xds_, std::chrono::milliseconds(0),
+        std::move(on_transport_established), std::move(on_transport_close));
+  } else {
+    subscription_ =
+        Cilium::subscribe("type.googleapis.com/cilium.NetworkPolicy", context_, *npds_stats_scope_,
+                          *this, std::make_shared<NetworkPolicyDecoder>(),
+                          subscription_use_delta_xds_, std::chrono::milliseconds(0),
+                          std::move(on_transport_established), std::move(on_transport_close));
+  }
+
+  if (subscription_should_start_) {
+    startSubscription();
+  }
 }
 
 void NetworkPolicyMapImpl::reopenIpcache() {
@@ -2255,6 +2369,7 @@ void NetworkPolicyMapImpl::scheduleSelectorGCAndDeferredDeletion(
 absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     const std::vector<Envoy::Config::DecodedResourceRef>& resources,
     const std::string& version_info) {
+  subscription_connected_ = true;
   auto stream_generation = streamGeneration();
   const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
   ENVOY_LOG(debug, "NetworkPolicyMapImpl::onConfigUpdate({}), {} resources, version: {}",
@@ -2329,6 +2444,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     const std::vector<Envoy::Config::DecodedResourceRef>& added_resources,
     const Protobuf::RepeatedPtrField<std::string>& removed_resources,
     const std::string& system_version_info) {
+  subscription_connected_ = true;
   auto stream_generation = streamGeneration();
   const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
   const auto& old_resource_map = resource_map_;
