@@ -207,6 +207,8 @@ public:
     return it != end() ? &it->second : nullptr;
   }
 
+  std::string findPolicyResourceName(const std::shared_ptr<const PolicyInstanceImpl>& policy) const;
+
   void replaceWith(std::vector<std::pair<std::string, ResourceKey>>&& entries) {
     clear();
     reserve(entries.size());
@@ -238,6 +240,11 @@ public:
     }
     return base_ ? base_->findEntry(key) : nullptr;
   }
+
+  std::string findPolicyResourceName(const std::shared_ptr<const PolicyInstanceImpl>& policy) const;
+
+  std::string describeExistingResourceKey(const std::string& key,
+                                          const PolicyMapSnapshot& policy_map) const;
 
   SelectorHandle getSelectorHandleOrThrow(const std::string& selector) const {
     const auto* entry = findEntry(selector);
@@ -2013,6 +2020,107 @@ private:
   const PortNetworkPolicy egress_;
 };
 
+template <class EndpointIps> std::string endpointIpsForLog(const EndpointIps& endpoint_ips) {
+  std::string formatted = "[";
+  bool first = true;
+  for (const auto& endpoint_ip : endpoint_ips) {
+    if (!first) {
+      formatted += ", ";
+    }
+    formatted += endpoint_ip;
+    first = false;
+  }
+  formatted += "]";
+  return formatted;
+}
+
+std::string describePolicyResourceForLog(absl::string_view resource_name,
+                                         const std::shared_ptr<const PolicyInstanceImpl>& policy) {
+  ASSERT(policy != nullptr, "policy resource description requires a policy");
+  return fmt::format("policy resource '{}' (endpoint_id {}, endpoint_ips {})", resource_name,
+                     policy->endpoint_id_, endpointIpsForLog(policy->policy_proto_.endpoint_ips()));
+}
+
+std::string describePolicyResourceForLog(absl::string_view resource_name,
+                                         const cilium::NetworkPolicy& policy) {
+  return fmt::format("policy resource '{}' (endpoint_id {}, endpoint_ips {})", resource_name,
+                     policy.endpoint_id(), endpointIpsForLog(policy.endpoint_ips()));
+}
+
+std::string
+ResourceMap::findPolicyResourceName(const std::shared_ptr<const PolicyInstanceImpl>& policy) const {
+  if (policy == nullptr) {
+    return {};
+  }
+  for (const auto& [resource_name, resource_key] : *this) {
+    const auto* policy_entry = resource_key.policyResourceEntry();
+    if (policy_entry != nullptr && policy_entry->policy == policy) {
+      return resource_name;
+    }
+  }
+  return {};
+}
+
+std::string ResourceMapOverlay::findPolicyResourceName(
+    const std::shared_ptr<const PolicyInstanceImpl>& policy) const {
+  if (policy == nullptr) {
+    return {};
+  }
+  for (const auto& [resource_name, resource_key] : upserts_) {
+    const auto* policy_entry = resource_key.policyResourceEntry();
+    if (policy_entry != nullptr && policy_entry->policy == policy) {
+      return resource_name;
+    }
+  }
+  if (base_ == nullptr) {
+    return {};
+  }
+  for (const auto& [resource_name, resource_key] : *base_) {
+    if (removed_.contains(resource_name)) {
+      continue;
+    }
+    const auto* policy_entry = resource_key.policyResourceEntry();
+    if (policy_entry != nullptr && policy_entry->policy == policy) {
+      return resource_name;
+    }
+  }
+  return {};
+}
+
+std::string
+ResourceMapOverlay::describeExistingResourceKey(const std::string& key,
+                                                const PolicyMapSnapshot& policy_map) const {
+  const auto* entry = findEntry(key);
+  if (entry == nullptr) {
+    return fmt::format("resource key '{}'", key);
+  }
+  if (entry->selectorResourceEntry() != nullptr) {
+    return fmt::format("selector resource '{}'", key);
+  }
+  if (const auto* policy_entry = entry->policyResourceEntry();
+      policy_entry != nullptr && policy_entry->policy != nullptr) {
+    return describePolicyResourceForLog(key, policy_entry->policy);
+  }
+  if (!entry->isPolicyEndpointIpEntry()) {
+    return fmt::format("resource key '{}'", key);
+  }
+
+  auto policy_it = policy_map.find(key);
+  if (policy_it == policy_map.end()) {
+    return fmt::format("endpoint IP alias '{}'", key);
+  }
+
+  const auto& policy = policy_it->second;
+  const auto resource_name = findPolicyResourceName(policy);
+  if (!resource_name.empty()) {
+    return fmt::format("endpoint IP alias '{}' owned by {}", key,
+                       describePolicyResourceForLog(resource_name, policy));
+  }
+
+  return fmt::format("endpoint IP alias '{}' owned by endpoint_id {} with endpoint_ips {}", key,
+                     policy->endpoint_id_, endpointIpsForLog(policy->policy_proto_.endpoint_ips()));
+}
+
 void ResourceMap::erasePolicyResource(PolicyMapSnapshot& policy_map,
                                       const std::string& resource_name,
                                       const std::shared_ptr<const PolicyInstanceImpl>& policy) {
@@ -2505,25 +2613,29 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     try {
       const auto selector_update_version = selector_map_.prepareNextVersion();
 
-      for (const auto& removed_resource : removed_resources) {
-        ENVOY_LOG(trace, "Cilium removing network policy resource {}", removed_resource);
-        const auto* resource_entry = pending_resource_map.findEntry(removed_resource);
+      for (const auto& resource : removed_resources) {
+        ENVOY_LOG(trace, "Cilium removing network policy selector resource {}", resource);
+        const auto* resource_entry = pending_resource_map.findEntry(resource);
         if (resource_entry == nullptr) {
+          ENVOY_LOG(
+              debug,
+              "NetworkPolicy delta removed selector resource name '{}' not found from resource map",
+              resource);
           continue;
         }
         if (resource_entry->isPolicyEndpointIpEntry()) {
-          throw EnvoyException(fmt::format(
-              "Network Policy delta removed resource '{}' is a policy endpoint IP alias, "
-              "not a resource name",
-              removed_resource));
+          throw EnvoyException(fmt::format("NetworkPolicy delta removed selector resource name "
+                                           "'{}' is a policy endpoint IP alias, "
+                                           "not a resource name",
+                                           resource));
         }
         if (resource_entry->policyResourceEntry()) {
-          throw EnvoyException(
-              fmt::format("Network Policy delta removed resource '{}' refers to a policy resource",
-                          removed_resource));
+          throw EnvoyException(fmt::format(
+              "NetworkPolicy delta removed selector resource name '{}' refers to a policy resource",
+              resource));
         }
-        selector_map_.clear(removed_resource);
-        pending_resource_map.erase(removed_resource);
+        selector_map_.clear(resource);
+        pending_resource_map.erase(resource);
       }
 
       for (const auto& resource : added_resources) {
@@ -2552,7 +2664,11 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
           if (!pending_resource_map.emplace(resource_name,
                                             ResourceKey::selectorResource(selector_handle))) {
             throw EnvoyException(fmt::format(
-                "Network Policy delta update has duplicate resource key '{}'", resource_name));
+                "Network Policy delta selector update for version {} has duplicate resource key "
+                "'{}' on an old stream: "
+                "incoming selector resource '{}' collides with existing {}",
+                system_version_info, resource_name, resource_name,
+                pending_resource_map.describeExistingResourceKey(resource_name, *load())));
           }
           break;
         }
@@ -2658,7 +2774,11 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
       if (!pending_resource_map.emplace(resource_name,
                                         ResourceKey::selectorResource(selector_handle))) {
         throw EnvoyException(fmt::format(
-            "Network Policy delta update has duplicate resource key '{}'", resource_name));
+            "Network Policy delta update for version {} has duplicate resource key '{}' on {} "
+            "stream: "
+            "incoming selector resource '{}' collides with existing {}",
+            system_version_info, resource_name, is_new_stream ? "a new" : "an old", resource_name,
+            pending_resource_map.describeExistingResourceKey(resource_name, new_policy_map)));
       }
     }
 
@@ -2688,17 +2808,32 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
                                           old_resource_map, &pending_resource_map);
         if (!pending_resource_map.emplace(resource_name, ResourceKey::policyResource(policy))) {
           throw EnvoyException(fmt::format(
-              "Network Policy delta update has duplicate resource key '{}'", resource_name));
+              "Network Policy delta update for version {} has duplicate resource key '{}' on {} "
+              "stream: "
+              "incoming {} collides with existing {}",
+              system_version_info, resource_name, is_new_stream ? "a new" : "an old",
+              describePolicyResourceForLog(resource_name, config),
+              pending_resource_map.describeExistingResourceKey(resource_name, new_policy_map)));
         }
         for (const auto& endpoint_ip : config.endpoint_ips()) {
           ENVOY_LOG(trace, "Cilium updating network policy for endpoint {}", endpoint_ip);
           if (!pending_resource_map.emplace(endpoint_ip, ResourceKey::policyEndpointIp())) {
             throw EnvoyException(fmt::format(
-                "Network Policy delta update has duplicate resource key '{}'", endpoint_ip));
+                "Network Policy delta update for version {} has duplicate resource key '{}' on {} "
+                "stream: "
+                "incoming {} collides with existing {}",
+                system_version_info, endpoint_ip, is_new_stream ? "a new" : "an old",
+                describePolicyResourceForLog(resource_name, config),
+                pending_resource_map.describeExistingResourceKey(endpoint_ip, new_policy_map)));
           }
           if (!new_policy_map.emplace(endpoint_ip, policy).second) {
             throw EnvoyException(fmt::format(
-                "Network Policy delta update has duplicate resource key '{}'", endpoint_ip));
+                "Network Policy delta update for version {} has duplicate resource key '{}' on {} "
+                "stream: "
+                "incoming {} collides with existing {}",
+                system_version_info, endpoint_ip, is_new_stream ? "a new" : "an old",
+                describePolicyResourceForLog(resource_name, config),
+                pending_resource_map.describeExistingResourceKey(endpoint_ip, new_policy_map)));
           }
         }
         break;

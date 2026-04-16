@@ -860,7 +860,8 @@ resources:
   EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
   EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
 
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
 resources:
 - name: "10.1.2.3"
   version: "1"
@@ -869,8 +870,8 @@ resources:
     selector:
       remote_identities: [ 44 ]
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key '10.1.2.3'");
+      EnvoyException,
+      R"(Network Policy delta .*update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming selector resource '10\.1\.2\.3'.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-42'.*endpoint_id 42.*10\.1\.2\.3)");
 
   EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
   EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
@@ -1163,7 +1164,8 @@ removed_resources:
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsDuplicatePolicyResourceNamesInSameUpdate) {
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
 resources:
 - name: "shared-name"
   version: "1"
@@ -1182,8 +1184,8 @@ resources:
       - "10.1.2.4"
       endpoint_id: 43
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key 'shared-name'");
+      EnvoyException,
+      R"(Network Policy delta update for version [0-9]+ has duplicate resource key 'shared-name'.*incoming policy resource 'shared-name'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource 'shared-name'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsPolicyResourceNamesThatDoNotMatchEndpointId) {
@@ -1203,7 +1205,8 @@ resources:
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsEndpointIpCollisionsInSameUpdate) {
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
 resources:
 - name: "policy-a"
   version: "1"
@@ -1222,12 +1225,13 @@ resources:
       - "10.1.2.3"
       endpoint_id: 43
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key '10.1.2.3'");
+      EnvoyException,
+      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.3.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsResourceNameEndpointIpCollisionsInSameUpdate) {
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
 resources:
 - name: "10.1.2.4"
   version: "1"
@@ -1246,12 +1250,13 @@ resources:
       - "10.1.2.4"
       endpoint_id: 43
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key '10.1.2.4'");
+      EnvoyException,
+      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.4'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource '10\.1\.2\.4'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsDuplicateSelectorResourceNamesInSameUpdate) {
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "1"
 resources:
 - name: "shared-selector"
   version: "1"
@@ -1266,9 +1271,8 @@ resources:
     selector:
       remote_identities: [ 46, 47 ]
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key "
-                            "'shared-selector'");
+      EnvoyException,
+      R"(Network Policy delta .*update for version [0-9]+ has duplicate resource key 'shared-selector'.*incoming selector resource 'shared-selector'.*existing selector resource 'shared-selector')");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsArbitraryPolicyResourceNamesWithHyphens) {
@@ -1343,7 +1347,8 @@ resources:
       endpoint_id: 42
 )EOF"));
 
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
 resources:
 - name: "policy-b"
   version: "1"
@@ -1354,8 +1359,8 @@ resources:
       - "10.1.2.3"
       endpoint_id: 43
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key '10.1.2.3'");
+      EnvoyException,
+      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.3.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest,
@@ -1372,7 +1377,8 @@ resources:
       endpoint_id: 42
 )EOF"));
 
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
 resources:
 - name: "10.1.2.3"
   version: "1"
@@ -1383,8 +1389,8 @@ resources:
       - "10.1.2.4"
       endpoint_id: 43
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key '10.1.2.3'");
+      EnvoyException,
+      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource '10\.1\.2\.3'.*endpoint_id 43.*10\.1\.2\.4.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest,
@@ -1401,7 +1407,8 @@ resources:
       endpoint_id: 42
 )EOF"));
 
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
 resources:
 - name: "policy-b"
   version: "1"
@@ -1412,8 +1419,8 @@ resources:
       - "10.1.2.4"
       endpoint_id: 43
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key '10.1.2.4'");
+      EnvoyException,
+      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.4'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource '10\.1\.2\.4'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest,
@@ -1430,7 +1437,8 @@ resources:
       endpoint_id: 42
 )EOF"));
 
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
 resources:
 - name: "shared-name"
   version: "1"
@@ -1439,8 +1447,8 @@ resources:
     selector:
       remote_identities: [ 43 ]
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key 'shared-name'");
+      EnvoyException,
+      R"(Network Policy delta .*update for version [0-9]+ has duplicate resource key 'shared-name'.*incoming selector resource 'shared-name'.*existing policy resource 'shared-name'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest,
@@ -1457,7 +1465,8 @@ resources:
       endpoint_id: 42
 )EOF"));
 
-  EXPECT_THROW_WITH_MESSAGE(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
+  EXPECT_THROW_WITH_REGEX(
+      deltaUpdateFromYaml(R"EOF(system_version_info: "2"
 resources:
 - name: "10.1.2.3"
   version: "1"
@@ -1466,8 +1475,8 @@ resources:
     selector:
       remote_identities: [ 43 ]
 )EOF"),
-                            EnvoyException,
-                            "Network Policy delta update has duplicate resource key '10.1.2.3'");
+      EnvoyException,
+      R"(Network Policy delta .*update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming selector resource '10\.1\.2\.3'.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsRemovingPolicyEndpointIpAlias) {
