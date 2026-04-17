@@ -2479,6 +2479,8 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     const std::string& version_info) {
   subscription_connected_ = true;
   auto stream_generation = streamGeneration();
+  // policy_stream_state_ gets updated on first successful update,
+  // so 'is_new_stream' remains 'true' as long as the stream has not had a successful update yet.
   const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
   ENVOY_LOG(debug, "NetworkPolicyMapImpl::onConfigUpdate({}), {} resources, version: {}",
             instance_id_, resources.size(), version_info);
@@ -2554,8 +2556,12 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     const std::string& system_version_info) {
   subscription_connected_ = true;
   auto stream_generation = streamGeneration();
+  // policy_stream_state_ gets updated on first successful update,
+  // so 'is_new_stream' remains 'true' as long as the stream has not had a successful update yet.
   const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
   const auto& old_resource_map = resource_map_;
+
+  // first find if this is a selector-only update
   bool updates_policies = false;
   bool updates_selectors = false;
   for (const auto& removed_resource : removed_resources) {
@@ -2590,6 +2596,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
       break;
     }
   }
+
   ENVOY_LOG(debug,
             "NetworkPolicyMapImpl::onConfigUpdate({}), {} added resources, {} removed resources, "
             "version: {}, updates_selectors: {}, updates_policies: {}",
@@ -2853,6 +2860,10 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   removeInitManager();
   installNewPolicyMap(std::move(new_policy_map), version_init_manager, std::move(version_name),
                       policy_stream_state);
+  // do not carry over any resources from an old stream
+  if (is_new_stream) {
+    resource_map_.clear();
+  }
   std::move(pending_resource_map).applyTo(resource_map_);
 
   return absl::OkStatus();
