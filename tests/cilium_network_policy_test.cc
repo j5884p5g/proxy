@@ -1801,8 +1801,10 @@ resources:
 
   const auto old_policy = policyInstanceShared("10.1.2.3");
   ASSERT_NE(nullptr, old_policy);
+  const auto initial_stream_generation = selectorStreamGenerationForTest(*old_policy);
 
-  EXPECT_EQ(1, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_GT(initial_stream_generation, 0);
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
   EXPECT_EQ(1, selectorVersionForTest(*old_policy));
 
   EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "2"
@@ -1815,7 +1817,7 @@ resources:
       remote_identities: [ 44 ]
 )EOF"));
 
-  EXPECT_EQ(1, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
   EXPECT_EQ(2, selectorVersionForTest(*old_policy));
   EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 80));
   EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));
@@ -1852,8 +1854,10 @@ resources:
 
   const auto old_policy = policyInstanceShared("10.1.2.3");
   ASSERT_NE(nullptr, old_policy);
+  const auto initial_stream_generation = selectorStreamGenerationForTest(*old_policy);
 
-  EXPECT_EQ(1, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_GT(initial_stream_generation, 0);
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
   EXPECT_EQ(1, selectorVersionForTest(*old_policy));
 
   EXPECT_NO_THROW(deltaUpdateFromYaml(R"EOF(system_version_info: "1"
@@ -1866,7 +1870,7 @@ resources:
       remote_identities: [ 45 ]
 )EOF"));
 
-  EXPECT_EQ(1, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
   EXPECT_EQ(2, selectorVersionForTest(*old_policy));
 
   resetStreamForTest();
@@ -1903,9 +1907,9 @@ resources:
   ASSERT_NE(nullptr, new_policy);
   EXPECT_NE(old_policy.get(), new_policy.get());
 
-  EXPECT_EQ(1, selectorStreamGenerationForTest(*old_policy));
+  EXPECT_EQ(initial_stream_generation, selectorStreamGenerationForTest(*old_policy));
   EXPECT_EQ(2, selectorVersionForTest(*old_policy));
-  EXPECT_EQ(2, selectorStreamGenerationForTest(*new_policy));
+  EXPECT_EQ(initial_stream_generation + 1, selectorStreamGenerationForTest(*new_policy));
   EXPECT_EQ(3, selectorVersionForTest(*new_policy));
   EXPECT_TRUE(ingressAllowed("10.1.2.3", 44, 80));
   EXPECT_FALSE(ingressAllowed("10.1.2.3", 43, 80));

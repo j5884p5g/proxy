@@ -411,12 +411,8 @@ public:
   }
 
 protected:
-  uint64_t streamGeneration() const {
-    return stream_generation_override_for_test_ != 0 ? stream_generation_override_for_test_
-                                                     : grpcStreamGeneration(subscription_.get());
-  }
-
-  void resetStreamForTest() { stream_generation_override_for_test_ = streamGeneration() + 1; }
+  uint64_t streamGeneration() const { return subscription_stream_generation_; }
+  void resetStreamForTest() { subscription_stream_generation_++; }
 
   // run the given function after all the threads have scheduled
   void runAfterAllThreads(std::function<void()> cb) const {
@@ -454,6 +450,8 @@ private:
   }
 
   void onSubscriptionTransportEstablished(uint64_t subscription_id) {
+    ++subscription_stream_generation_;
+
     if (subscription_id != subscription_id_) {
       return;
     }
@@ -561,10 +559,8 @@ private:
       transport_factory_context_;
 
   std::unique_ptr<Envoy::Config::Subscription> subscription_;
+  static uint64_t subscription_stream_generation_;
   NetworkPolicyMap::SubscriptionFactoryForTest subscription_factory_for_test_;
-  // Test-only override used to simulate a restarted NPDS stream when the test subscription does
-  // not expose a new underlying gRPC stream generation.
-  uint64_t stream_generation_override_for_test_{0};
 
   ProtobufTypes::MessagePtr dumpNetworkPolicyConfigs(const Matchers::StringMatcher& name_matcher);
   Server::ConfigTracker::EntryOwnerPtr config_tracker_entry_;
@@ -576,6 +572,7 @@ protected:
 };
 
 uint64_t NetworkPolicyMapImpl::instance_id_ = 0;
+uint64_t NetworkPolicyMapImpl::subscription_stream_generation_ = 1;
 
 IpAddressPair::IpAddressPair(const cilium::NetworkPolicy& proto) {
   for (const auto& ip_addr : proto.endpoint_ips()) {

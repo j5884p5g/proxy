@@ -25,12 +25,6 @@ subscribe(const std::string& type_url, Server::Configuration::CommonFactoryConte
           std::function<void()> on_transport_established = {},
           std::function<void()> on_transport_close = {});
 
-// Returns a monotonic stream generation for Cilium subscriptions.
-// Value 0 is reserved for policy-map detection of the initial stream and may be returned for
-// tracked gRPC subscriptions before any stream has been established.
-// Non-gRPC subscriptions and subscriptions without stream tracking are treated as generation 1.
-uint64_t grpcStreamGeneration(Config::Subscription* subscription);
-
 // Returns whether a tracked gRPC subscription currently has an established transport.
 bool grpcStreamConnected(Config::Subscription* subscription);
 

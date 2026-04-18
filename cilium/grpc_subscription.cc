@@ -43,13 +43,34 @@ namespace Cilium {
 
 namespace {
 
-constexpr uint64_t FirstStreamGeneration = 1;
-
 class StreamTrackedGrpcMux {
 public:
+  StreamTrackedGrpcMux(std::function<void()> on_transport_established,
+                       std::function<void()> on_transport_close)
+      : on_transport_established_(std::move(on_transport_established)),
+        on_transport_close_(std::move(on_transport_close)) {}
+
   virtual ~StreamTrackedGrpcMux() = default;
-  virtual uint64_t streamGeneration() const = 0;
-  virtual bool streamConnected() const = 0;
+
+  bool streamConnected() const { return stream_connected_; }
+
+  void onStreamEstablished() {
+    stream_connected_ = true;
+    on_transport_established_();
+  }
+
+  void onEstablishmentFailure() {
+    const bool was_connected = stream_connected_;
+    stream_connected_ = false;
+    if (was_connected) {
+      on_transport_close_();
+    }
+  }
+
+private:
+  bool stream_connected_{false};
+  std::function<void()> on_transport_established_;
+  std::function<void()> on_transport_close_;
 };
 
 class SotwGrpcMuxImpl : public Config::GrpcMuxImpl, public StreamTrackedGrpcMux {
@@ -58,37 +79,18 @@ public:
                   std::function<void()> on_transport_established,
                   std::function<void()> on_transport_close)
       : Config::GrpcMuxImpl(grpc_mux_context, skip_subsequent_node),
-        on_transport_established_(std::move(on_transport_established)),
-        on_transport_close_(std::move(on_transport_close)) {}
-
+        StreamTrackedGrpcMux(std::move(on_transport_established), std::move(on_transport_close)) {}
   ~SotwGrpcMuxImpl() override = default;
 
   void onStreamEstablished() override {
-    stream_connected_ = true;
-    ++stream_generation_;
     Config::GrpcMuxImpl::onStreamEstablished();
-    if (on_transport_established_) {
-      on_transport_established_();
-    }
+    StreamTrackedGrpcMux::onStreamEstablished();
   }
 
   void onEstablishmentFailure(bool next_attempt_may_send_initial_resource_version) override {
-    const bool was_connected = stream_connected_;
-    stream_connected_ = false;
     Config::GrpcMuxImpl::onEstablishmentFailure(next_attempt_may_send_initial_resource_version);
-    if (was_connected && on_transport_close_) {
-      on_transport_close_();
-    }
+    StreamTrackedGrpcMux::onEstablishmentFailure();
   }
-
-  uint64_t streamGeneration() const override { return stream_generation_; }
-  bool streamConnected() const override { return stream_connected_; }
-
-private:
-  uint64_t stream_generation_{0};
-  bool stream_connected_{false};
-  std::function<void()> on_transport_established_;
-  std::function<void()> on_transport_close_;
 };
 
 class DeltaGrpcMuxImpl : public Config::NewGrpcMuxImpl, public StreamTrackedGrpcMux {
@@ -97,37 +99,19 @@ public:
                             std::function<void()> on_transport_established,
                             std::function<void()> on_transport_close)
       : Config::NewGrpcMuxImpl(grpc_mux_context),
-        on_transport_established_(std::move(on_transport_established)),
-        on_transport_close_(std::move(on_transport_close)) {}
+        StreamTrackedGrpcMux(std::move(on_transport_established), std::move(on_transport_close)) {}
 
   ~DeltaGrpcMuxImpl() override = default;
 
   void onStreamEstablished() override {
-    stream_connected_ = true;
-    ++stream_generation_;
     Config::NewGrpcMuxImpl::onStreamEstablished();
-    if (on_transport_established_) {
-      on_transport_established_();
-    }
+    StreamTrackedGrpcMux::onStreamEstablished();
   }
 
   void onEstablishmentFailure(bool next_attempt_may_send_initial_resource_version) override {
-    const bool was_connected = stream_connected_;
-    stream_connected_ = false;
     Config::NewGrpcMuxImpl::onEstablishmentFailure(next_attempt_may_send_initial_resource_version);
-    if (was_connected && on_transport_close_) {
-      on_transport_close_();
-    }
+    StreamTrackedGrpcMux::onEstablishmentFailure();
   }
-
-  uint64_t streamGeneration() const override { return stream_generation_; }
-  bool streamConnected() const override { return stream_connected_; }
-
-private:
-  uint64_t stream_generation_{0};
-  bool stream_connected_{false};
-  std::function<void()> on_transport_established_;
-  std::function<void()> on_transport_close_;
 };
 
 // service RPC method fully qualified names.
@@ -232,20 +216,6 @@ envoy::config::core::v3::ConfigSource getCiliumXDSAPIConfig(bool use_delta_xds =
 }
 
 envoy::config::core::v3::ConfigSource cilium_xds_api_config = getCiliumXDSAPIConfig();
-
-uint64_t grpcStreamGeneration(Config::Subscription* subscription) {
-  auto* sub = dynamic_cast<Config::GrpcSubscriptionImpl*>(subscription);
-  if (!sub) {
-    return FirstStreamGeneration;
-  }
-
-  auto* grpc_mux = dynamic_cast<StreamTrackedGrpcMux*>(sub->grpcMux().get());
-  if (grpc_mux == nullptr) {
-    return FirstStreamGeneration;
-  }
-
-  return grpc_mux->streamGeneration();
-}
 
 bool grpcStreamConnected(Config::Subscription* subscription) {
   auto* sub = dynamic_cast<Config::GrpcSubscriptionImpl*>(subscription);
