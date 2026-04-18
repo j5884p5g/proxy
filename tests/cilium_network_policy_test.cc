@@ -135,8 +135,7 @@ protected:
   std::string deltaUpdateFromYaml(const std::string& config) {
     envoy::service::discovery::v3::DeltaDiscoveryResponse message;
     MessageUtil::loadFromYaml(config, message, ProtobufMessage::getNullValidationVisitor());
-    NetworkPolicyResourceDecoder network_policy_resource_decoder(
-        ProtobufMessage::getNullValidationVisitor(), "name");
+    NetworkPolicyResourceDecoder network_policy_resource_decoder;
     auto decoded_resources = std::make_unique<Config::DecodedResourcesWrapper>();
     for (const auto& resource : message.resources()) {
       decoded_resources->pushBack(

@@ -45,7 +45,6 @@
 #include "source/common/init/target_impl.h"
 #include "source/common/init/watcher_impl.h"
 #include "source/common/network/utility.h"
-#include "source/common/protobuf/message_validator_impl.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
 #include "source/server/transport_socket_config_impl.h"
@@ -327,8 +326,10 @@ private:
 };
 
 // helper for validating resource names.
-void validateResourceNameHasNoWhitespace(absl::string_view resource_name,
-                                         absl::string_view subject) {
+void validateResourceName(absl::string_view resource_name, absl::string_view subject) {
+  if (resource_name.empty()) {
+    throw EnvoyException(fmt::format("{} must not be empty", subject));
+  }
   if (std::ranges::any_of(resource_name, [](unsigned char c) { return absl::ascii_isspace(c); })) {
     throw EnvoyException(
         fmt::format("{} '{}' must not contain whitespace", subject, resource_name));
@@ -431,8 +432,8 @@ protected:
   std::shared_ptr<const PolicyInstanceImpl>
   createOrReusePolicy(const std::string& resource_name, const cilium::NetworkPolicy& config,
                       const PolicyStreamStateConstSharedPtr& policy_stream_state,
-                      const ResourceMap& old_resource_map,
-                      const ResourceMapOverlay* selector_resource_map);
+                      const ResourceMap& resource_map,
+                      const ResourceMapOverlay* pending_resource_map);
 
   SelectorHandle createOrReuseSelector(const std::string& resource_name,
                                        const cilium::Selector& config, uint64_t update_version);
@@ -939,7 +940,7 @@ public:
 
   PortNetworkPolicyRule(const NetworkPolicyMapImpl& parent,
                         const cilium::PortNetworkPolicyRule& rule,
-                        const ResourceMapOverlay* selector_resource_map)
+                        const ResourceMapOverlay* resource_map)
       : name_(rule.name()),
         verdict_(rule.pass_precedence() ? RuleVerdict::Pass
                                         : (rule.deny() ? RuleVerdict::Deny : RuleVerdict::Allow)),
@@ -950,7 +951,7 @@ public:
           fmt::format("PortNetworkPolicyRule: pass_precedence {} must be lower than precedence {}",
                       tier_last_precedence_, precedence_));
     }
-    if (selector_resource_map) {
+    if (resource_map) {
       if (rule.remote_policies_size()) {
         throw EnvoyException(
             "Delta Network Policy rule must use selectors instead of remote_policies");
@@ -959,7 +960,7 @@ public:
       for (const auto& selector : rule.selectors()) {
         ENVOY_LOG(trace, "Cilium L7 PortNetworkPolicyRule(): {} selector {} by rule: {}", verdict_,
                   selector, name_);
-        selectors_.emplace_back(selector_resource_map->getSelectorHandleOrThrow(selector));
+        selectors_.emplace_back(resource_map->getSelectorHandleOrThrow(selector));
       }
     } else {
       if (rule.selectors_size()) {
@@ -1301,14 +1302,14 @@ public:
   // we must add a default allow rule to retain the semantics of an empty rules.
   void prepend(const NetworkPolicyMapImpl& parent,
                const Protobuf::RepeatedPtrField<cilium::PortNetworkPolicyRule>& rules,
-               const ResourceMapOverlay* selector_resource_map) {
+               const ResourceMapOverlay* resource_map) {
     if (initialized_ && rules.empty() != rules_.empty()) {
       // add an explicit allow-all rule to keep the combined semantics
       rules_.emplace(rules_.begin(), std::make_shared<PortNetworkPolicyRule>());
     }
     for (const auto& it : rules) {
       rules_.emplace(rules_.begin(),
-                     std::make_shared<PortNetworkPolicyRule>(parent, it, selector_resource_map));
+                     std::make_shared<PortNetworkPolicyRule>(parent, it, resource_map));
       updateFor(rules_.front());
     }
     initialized_ = true;
@@ -1715,7 +1716,7 @@ class PortNetworkPolicy : public Logger::Loggable<Logger::Id::config> {
 public:
   PortNetworkPolicy(const NetworkPolicyMapImpl& parent,
                     const Protobuf::RepeatedPtrField<cilium::PortNetworkPolicy>& rules,
-                    const ResourceMapOverlay* selector_resource_map) {
+                    const ResourceMapOverlay* resource_map) {
     for (const auto& rule : rules) {
       // Only TCP supported for HTTP
       if (rule.protocol() == envoy::config::core::v3::SocketAddress::TCP) {
@@ -1874,10 +1875,10 @@ public:
             // so the relative order of rules from this batch is reversed. This
             // is harmless: equal-precedence rules are evaluated as alternatives
             // (stable sort only affects presentation/debug ordering).
-            rules.prepend(parent, rule.rules(), selector_resource_map);
+            rules.prepend(parent, rule.rules(), resource_map);
           } else {
             // Rules with a non-trivial range go to the back of the list
-            rules.append(parent, rule.rules(), selector_resource_map);
+            rules.append(parent, rule.rules(), resource_map);
           }
         }
       } else {
@@ -1958,11 +1959,11 @@ public:
   PolicyInstanceImpl(const NetworkPolicyMapImpl& parent, uint64_t hash,
                      const cilium::NetworkPolicy& proto,
                      const PolicyStreamStateConstSharedPtr& policy_stream_state,
-                     const ResourceMapOverlay* selector_resource_map)
+                     const ResourceMapOverlay* resource_map)
       : endpoint_id_(proto.endpoint_id()), hash_(hash), policy_proto_(proto), endpoint_ips_(proto),
         parent_(parent), policy_stream_state_(policy_stream_state),
-        ingress_(parent, policy_proto_.ingress_per_port_policies(), selector_resource_map),
-        egress_(parent, policy_proto_.egress_per_port_policies(), selector_resource_map) {}
+        ingress_(parent, policy_proto_.ingress_per_port_policies(), resource_map),
+        egress_(parent, policy_proto_.egress_per_port_policies(), resource_map) {}
 
   bool allowed(bool ingress, uint16_t proxy_id, uint32_t remote_id, uint16_t port,
                Envoy::Http::RequestHeaderMap& headers,
@@ -2323,10 +2324,9 @@ void NetworkPolicyMapImpl::subscribe() {
   if (subscription_use_delta_xds_) {
     subscription_ = Cilium::subscribe(
         "type.googleapis.com/cilium.NetworkPolicyResource", context_, *npds_stats_scope_, *this,
-        std::make_shared<NetworkPolicyResourceDecoder>(ProtobufMessage::getNullValidationVisitor(),
-                                                       "name"),
-        subscription_use_delta_xds_, std::chrono::milliseconds(0),
-        std::move(on_transport_established), std::move(on_transport_close));
+        std::make_shared<NetworkPolicyResourceDecoder>(), subscription_use_delta_xds_,
+        std::chrono::milliseconds(0), std::move(on_transport_established),
+        std::move(on_transport_close));
   } else {
     subscription_ =
         Cilium::subscribe("type.googleapis.com/cilium.NetworkPolicy", context_, *npds_stats_scope_,
@@ -2353,27 +2353,27 @@ void NetworkPolicyMapImpl::reopenIpcache() {
 
 std::shared_ptr<const PolicyInstanceImpl> NetworkPolicyMapImpl::createOrReusePolicy(
     const std::string& resource_name, const cilium::NetworkPolicy& config,
-    const PolicyStreamStateConstSharedPtr& policy_stream_state, const ResourceMap& old_resource_map,
-    const ResourceMapOverlay* selector_resource_map) {
+    const PolicyStreamStateConstSharedPtr& policy_stream_state, const ResourceMap& resource_map,
+    const ResourceMapOverlay* pending_resource_map) {
   const uint64_t new_hash = MessageUtil::hash(config);
-  auto it = old_resource_map.find(resource_name);
-  if (it != old_resource_map.cend()) {
+  auto it = resource_map.find(resource_name);
+  if (it != resource_map.cend()) {
     const auto* old_policy_entry = it->second.policyResourceEntry();
     if (old_policy_entry == nullptr) {
       return std::make_shared<const PolicyInstanceImpl>(*this, new_hash, config,
-                                                        policy_stream_state, selector_resource_map);
+                                                        policy_stream_state, pending_resource_map);
     }
     const auto& old_policy = old_policy_entry->policy;
     if (old_policy && old_policy->hash_ == new_hash &&
         Protobuf::util::MessageDifferencer::Equals(old_policy->policy_proto_, config) &&
-        !(selector_resource_map && policyUsesSelectors(config))) {
+        !(pending_resource_map && policyUsesSelectors(config))) {
       ENVOY_LOG(trace, "New policy is equal to old one, not updating.");
       return old_policy;
     }
   }
 
   return std::make_shared<const PolicyInstanceImpl>(*this, new_hash, config, policy_stream_state,
-                                                    selector_resource_map);
+                                                    pending_resource_map);
 }
 
 SelectorHandle NetworkPolicyMapImpl::createOrReuseSelector(const std::string& resource_name,
@@ -2503,7 +2503,6 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   // SDS secrets will use this!
   transport_factory_context_->setInitManager(version_init_manager);
 
-  const auto& old_resource_map = resource_map_;
   const auto policy_stream_state =
       is_new_stream
           ? std::make_shared<PolicyStreamState>(stream_generation, selector_map_.getVersion())
@@ -2514,7 +2513,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     for (const auto& resource : resources) {
       const auto& config = dynamic_cast<const cilium::NetworkPolicy&>(resource.get().resource());
       const std::string& resource_name = resource.get().name();
-      validateResourceNameHasNoWhitespace(resource_name, "Network Policy resource name");
+      validateResourceName(resource_name, "Network Policy resource name");
       if (config.endpoint_ips().empty()) {
         throw EnvoyException("Network Policy has no endpoint ips");
       }
@@ -2523,8 +2522,8 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
                 "version {}",
                 config.endpoint_id(), config.endpoint_ips()[0], version_info);
 
-      auto policy = createOrReusePolicy(resource_name, config, policy_stream_state,
-                                        old_resource_map, nullptr);
+      auto policy =
+          createOrReusePolicy(resource_name, config, policy_stream_state, resource_map_, nullptr);
       if (!resource_name.empty()) {
         resource_entries.emplace_back(resource_name, ResourceKey::policyResource(policy));
       }
@@ -2559,16 +2558,14 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   // policy_stream_state_ gets updated on first successful update,
   // so 'is_new_stream' remains 'true' as long as the stream has not had a successful update yet.
   const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
-  const auto& old_resource_map = resource_map_;
 
   // first find if this is a selector-only update
   bool updates_policies = false;
   bool updates_selectors = false;
   for (const auto& removed_resource : removed_resources) {
-    validateResourceNameHasNoWhitespace(removed_resource,
-                                        "Network Policy delta removed resource name");
-    auto resource_it = old_resource_map.find(removed_resource);
-    if (resource_it == old_resource_map.end()) {
+    validateResourceName(removed_resource, "Network Policy delta removed resource name");
+    auto resource_it = resource_map_.find(removed_resource);
+    if (resource_it == resource_map_.end()) {
       continue;
     }
     if (resource_it->second.selectorResourceEntry()) {
@@ -2584,7 +2581,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     if (resource_name.empty()) {
       throw EnvoyException("Network Policy delta resource has no name");
     }
-    validateResourceNameHasNoWhitespace(resource_name, "Network Policy delta resource name");
+    validateResourceName(resource_name, "Network Policy delta resource name");
     switch (typed_resource.resource_case()) {
     case cilium::NetworkPolicyResource::kPolicy:
       updates_policies = true;
@@ -2811,8 +2808,8 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
                   resource_name, config.endpoint_id(), config.endpoint_ips()[0],
                   system_version_info);
 
-        auto policy = createOrReusePolicy(resource_name, config, policy_stream_state,
-                                          old_resource_map, &pending_resource_map);
+        auto policy = createOrReusePolicy(resource_name, config, policy_stream_state, resource_map_,
+                                          &pending_resource_map);
         if (!pending_resource_map.emplace(resource_name, ResourceKey::policyResource(policy))) {
           throw EnvoyException(fmt::format(
               "Network Policy delta update for version {} has duplicate resource key '{}' on {} "

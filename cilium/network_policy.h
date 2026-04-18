@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 
+#include "envoy/common/exception.h"
 #include "envoy/common/pure.h"
 #include "envoy/common/regex.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -24,7 +25,6 @@
 #include "source/common/common/logger.h"
 #include "source/common/common/macros.h"
 #include "source/common/common/thread.h"
-#include "source/common/config/opaque_resource_decoder_impl.h"
 #include "source/common/protobuf/message_validator_impl.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
@@ -170,8 +170,34 @@ private:
   ProtobufMessage::ValidationVisitor& validation_visitor_;
 };
 
-using NetworkPolicyResourceDecoder =
-    Envoy::Config::OpaqueResourceDecoderImpl<cilium::NetworkPolicyResource>;
+// cilium::NetworkPolicyResource does not carry a resource name, but relies on the
+// DeltaDiscoveryRespons Resource wrapper to have the name. Hence can not use
+// Envoy::Config::OpaqueResourceDecoderImpl<cilium::NetworkPolicyResource>
+class NetworkPolicyResourceDecoder : public Envoy::Config::OpaqueResourceDecoder {
+public:
+  NetworkPolicyResourceDecoder()
+      : validation_visitor_(ProtobufMessage::getNullValidationVisitor()) {}
+
+  // Config::OpaqueResourceDecoder
+  ProtobufTypes::MessagePtr decodeResource(const Protobuf::Any& resource) override {
+    auto typed_message = std::make_unique<cilium::NetworkPolicyResource>();
+    // If the Any is a synthetic empty message (e.g. because the resource field
+    // was not set in Resource, this might be empty, so we shouldn't decode.
+    if (!resource.type_url().empty()) {
+      MessageUtil::anyConvertAndValidate<cilium::NetworkPolicyResource>(resource, *typed_message,
+                                                                        validation_visitor_);
+    }
+    return typed_message;
+  }
+
+  std::string resourceName(const Protobuf::Message&) override {
+    throw EnvoyException(
+        "NetworkPolicyResource does not carry a name and must be wrapped in Resource");
+  }
+
+private:
+  ProtobufMessage::ValidationVisitor& validation_visitor_;
+};
 
 /**
  * All Cilium L7 filter stats. @see stats_macros.h
