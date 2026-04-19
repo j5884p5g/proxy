@@ -348,7 +348,7 @@ TEST_F(CiliumNetworkPolicyDeltaTest, ManagedSubscriptionColdStartUsesConfiguredD
   EXPECT_THAT(state->start_resources_.front(), testing::ElementsAre(std::string("*")));
 }
 
-TEST_F(CiliumNetworkPolicyTest, FlagFlipOnHealthySubscriptionWaitsForTransportClose) {
+TEST_F(CiliumNetworkPolicyTest, FlagFlipFromSotwToDeltaOnHealthySubscriptionRecreatesImmediately) {
   auto state = std::make_shared<FakeSubscriptionState>();
   std::vector<bool> created_modes;
   setSubscriptionFactoryForTest(
@@ -364,18 +364,57 @@ TEST_F(CiliumNetworkPolicyTest, FlagFlipOnHealthySubscriptionWaitsForTransportCl
   setUseDeltaXds(true);
 
   EXPECT_TRUE(configuredUseDeltaXds());
-  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_THAT(state->start_resources_.back(), testing::ElementsAre(std::string("*")));
+}
+
+TEST_F(CiliumNetworkPolicyTest, FlagFlipFromDeltaToSotwOnHealthySubscriptionWaitsForClose) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+  ASSERT_FALSE(subscriptionUseDeltaXdsForTest());
+
+  setUseDeltaXds(true);
+
+  EXPECT_TRUE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_THAT(state->start_resources_.back(), testing::ElementsAre(std::string("*")));
+
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+
+  setUseDeltaXds(false);
+
+  EXPECT_FALSE(configuredUseDeltaXds());
+  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
   EXPECT_TRUE(subscriptionConnectedForTest());
-  EXPECT_THAT(created_modes, testing::ElementsAre(false));
-  EXPECT_EQ(state->start_calls_, 1);
+  // Once we have an established delta subscription, keep it until transport close even if the
+  // configured desired mode flips back to SotW.
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
+  EXPECT_EQ(state->start_calls_, 2);
 
   onSubscriptionTransportCloseForTest();
 
   EXPECT_FALSE(subscriptionConnectedForTest());
-  EXPECT_TRUE(subscriptionUseDeltaXdsForTest());
-  EXPECT_THAT(created_modes, testing::ElementsAre(false, true));
-  EXPECT_EQ(state->start_calls_, 2);
-  EXPECT_THAT(state->start_resources_.back(), testing::ElementsAre(std::string("*")));
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, true, false));
+  EXPECT_EQ(state->start_calls_, 3);
+  EXPECT_TRUE(state->start_resources_.back().empty());
 }
 
 TEST_F(CiliumNetworkPolicyTest, FlagFlipWhileDisconnectedRecreatesImmediately) {
@@ -400,7 +439,66 @@ TEST_F(CiliumNetworkPolicyTest, FlagFlipWhileDisconnectedRecreatesImmediately) {
   EXPECT_THAT(state->start_resources_.back(), testing::ElementsAre(std::string("*")));
 }
 
-TEST_F(CiliumNetworkPolicyTest, TransportCloseWithoutFlagFlipKeepsCurrentMode) {
+TEST_F(CiliumNetworkPolicyDeltaTest, FlagFlipFromDisconnectedDeltaToSotwRecreatesImmediately) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  ASSERT_FALSE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+
+  setUseDeltaXds(false);
+
+  EXPECT_FALSE(configuredUseDeltaXds());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(true, false));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+}
+
+TEST_F(CiliumNetworkPolicyDeltaTest, DowngradeFromConnectedDeltaRecreatesDisconnectedRetryToSotw) {
+  auto state = std::make_shared<FakeSubscriptionState>();
+  std::vector<bool> created_modes;
+  setSubscriptionFactoryForTest(
+      [state, &created_modes](bool use_delta_xds) -> std::unique_ptr<Envoy::Config::Subscription> {
+        created_modes.push_back(use_delta_xds);
+        return std::make_unique<FakeSubscription>(state);
+      });
+
+  startManagedSubscriptionForTest();
+  onSubscriptionConnectedForTest();
+  ASSERT_TRUE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+
+  // Agent restart/downgrade drops the established delta transport. While the desired mode is still
+  // delta we recreate immediately and begin retrying delta.
+  onSubscriptionTransportCloseForTest();
+
+  ASSERT_FALSE(subscriptionConnectedForTest());
+  ASSERT_TRUE(subscriptionUseDeltaXdsForTest());
+  ASSERT_EQ(state->start_calls_, 2);
+  EXPECT_THAT(created_modes, testing::ElementsAre(true, true));
+  EXPECT_THAT(state->start_resources_.back(), testing::ElementsAre(std::string("*")));
+
+  // When listener metadata later reveals the downgraded agent no longer supports delta, flip to
+  // SotW immediately rather than letting the disconnected delta retry loop forever.
+  setUseDeltaXds(false);
+
+  EXPECT_FALSE(configuredUseDeltaXds());
+  EXPECT_FALSE(subscriptionConnectedForTest());
+  EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
+  EXPECT_THAT(created_modes, testing::ElementsAre(true, true, false));
+  EXPECT_EQ(state->start_calls_, 3);
+  EXPECT_TRUE(state->start_resources_.back().empty());
+}
+
+TEST_F(CiliumNetworkPolicyTest, TransportCloseWithoutFlagFlipRecreatesInCurrentMode) {
   auto state = std::make_shared<FakeSubscriptionState>();
   std::vector<bool> created_modes;
   setSubscriptionFactoryForTest(
@@ -416,8 +514,9 @@ TEST_F(CiliumNetworkPolicyTest, TransportCloseWithoutFlagFlipKeepsCurrentMode) {
 
   EXPECT_FALSE(subscriptionConnectedForTest());
   EXPECT_FALSE(subscriptionUseDeltaXdsForTest());
-  EXPECT_THAT(created_modes, testing::ElementsAre(false));
-  EXPECT_EQ(state->start_calls_, 1);
+  EXPECT_THAT(created_modes, testing::ElementsAre(false, false));
+  EXPECT_EQ(state->start_calls_, 2);
+  EXPECT_TRUE(state->start_resources_.back().empty());
 }
 
 TEST_F(CiliumNetworkPolicyTest, EmptyPolicyUpdate) {

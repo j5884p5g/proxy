@@ -253,8 +253,8 @@ public:
     }
     const auto* selector_entry = entry->selectorResourceEntry();
     if (selector_entry == nullptr || selector_entry->handle == nullptr) {
-      throw EnvoyException(
-          fmt::format("NetworkPolicyResource rule references non-selector resource '{}'", selector));
+      throw EnvoyException(fmt::format(
+          "NetworkPolicyResource rule references non-selector resource '{}'", selector));
     }
     return selector_entry->handle;
   }
@@ -407,7 +407,7 @@ public:
     if (!subscription_connected_ && subscription_ != nullptr) {
       subscription_connected_ = grpcStreamConnected(subscription_.get());
     }
-    maybeRecreateSubscriptionInDesiredMode();
+    maybeRecreateSubscriptionInDesiredMode(/*transport_closed=*/false);
   }
 
 protected:
@@ -450,27 +450,57 @@ private:
   }
 
   void onSubscriptionTransportEstablished(uint64_t subscription_id) {
-    ++subscription_stream_generation_;
-
+    // skip stale notifications for earlier subscriptions
     if (subscription_id != subscription_id_) {
       return;
     }
+    ++subscription_stream_generation_;
+
     subscription_connected_ = true;
   }
 
   void onSubscriptionTransportClosed(uint64_t subscription_id) {
+    // skip stale notifications for earlier subscriptions
     if (subscription_id != subscription_id_) {
       return;
     }
     subscription_connected_ = false;
-    maybeRecreateSubscriptionInDesiredMode();
-  }
 
-  void maybeRecreateSubscriptionInDesiredMode() {
-    if (subscription_ == nullptr || subscription_connected_ ||
-        desired_use_delta_xds_ == subscription_use_delta_xds_) {
+    // Test code executes synchronously
+    if (subscription_factory_for_test_) {
+      maybeRecreateSubscriptionInDesiredMode(/*transport_closed=*/true);
       return;
     }
+
+    // The close callback runs on the subscription object's own stack, so defer any possible
+    // recreation until after it unwinds to avoid destroying the current subscription mid-callback.
+    context_.mainThreadDispatcher().post(
+        [weak_this = weak_from_this(), subscription_id = subscription_id_]() {
+          if (auto shared_this = weak_this.lock()) {
+            // skip stale callbacks for earlier subscriptions
+            if (subscription_id != shared_this->subscription_id_) {
+              return;
+            }
+            shared_this->maybeRecreateSubscriptionInDesiredMode(/*transport_closed=*/true);
+          }
+        });
+  }
+
+  void maybeRecreateSubscriptionInDesiredMode(bool transport_closed) {
+    // only ever skip subscribe if we have a subscription already, and it is already connected in
+    // delta or desired mode, or still connecting in desired mode.
+    if (subscription_ && (subscription_connected_ || !transport_closed)) {
+      if (subscription_connected_ && subscription_use_delta_xds_) {
+        // Keep delta on a connected subscription until transport closes.
+        return;
+      }
+      if (subscription_use_delta_xds_ == desired_use_delta_xds_) {
+        // Let the current subscription keep going when it is already in the desired mode.
+        return;
+      }
+    }
+
+    // Recreate the subscription in the latest desired mode.
     subscribe();
   }
 
@@ -2618,10 +2648,9 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
         ENVOY_LOG(trace, "Cilium removing NetworkPolicyResource selector {}", resource);
         const auto* resource_entry = pending_resource_map.findEntry(resource);
         if (resource_entry == nullptr) {
-          ENVOY_LOG(
-              debug,
-              "NetworkPolicyResource removed selector name '{}' not found from resource map",
-              resource);
+          ENVOY_LOG(debug,
+                    "NetworkPolicyResource removed selector name '{}' not found from resource map",
+                    resource);
           continue;
         }
         if (resource_entry->isPolicyEndpointIpEntry()) {
