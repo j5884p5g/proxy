@@ -445,7 +445,7 @@ resources:
     endpoint_id: 42
 )EOF"),
                             EnvoyException,
-                            "Network Policy resource name 'policy 42' must not contain whitespace");
+                            "NetworkPolicy resource name 'policy 42' must not contain whitespace");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaIncrementalPolicyUpdate) {
@@ -717,7 +717,7 @@ resources:
         - selectors: [ "selector-2" ]
 )EOF"),
                             EnvoyException,
-                            "Delta Network Policy rule references missing selector resource "
+                            "NetworkPolicyResource rule references missing selector resource "
                             "'selector-2'");
 
   EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
@@ -870,7 +870,7 @@ resources:
       remote_identities: [ 44 ]
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta .*update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming selector resource '10\.1\.2\.3'.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-42'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource .*update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming selector resource '10\.1\.2\.3'.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-42'.*endpoint_id 42.*10\.1\.2\.3)");
 
   EXPECT_TRUE(ingressAllowed("10.1.2.3", 43, 80));
   EXPECT_FALSE(ingressAllowed("10.1.2.3", 44, 80));
@@ -1149,7 +1149,7 @@ resources:
       remote_identities: [ 43 ]
 )EOF"),
       EnvoyException,
-      "Network Policy delta resource name 'selector 1' must not contain whitespace");
+      "NetworkPolicyResource added resource name 'selector 1' must not contain whitespace");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsRemovedResourceNamesWithWhitespace) {
@@ -1159,7 +1159,7 @@ removed_resources:
 - "selector 1"
 )EOF"),
       EnvoyException,
-      "Network Policy delta removed resource name 'selector 1' must not contain whitespace");
+      "NetworkPolicyResource removed resource name 'selector 1' must not contain whitespace");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsDuplicatePolicyResourceNamesInSameUpdate) {
@@ -1184,7 +1184,7 @@ resources:
       endpoint_id: 43
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta update for version [0-9]+ has duplicate resource key 'shared-name'.*incoming policy resource 'shared-name'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource 'shared-name'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key 'shared-name'.*incoming policy resource 'shared-name'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource 'shared-name'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsPolicyResourceNamesThatDoNotMatchEndpointId) {
@@ -1225,7 +1225,7 @@ resources:
       endpoint_id: 43
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.3.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.3.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsResourceNameEndpointIpCollisionsInSameUpdate) {
@@ -1250,7 +1250,7 @@ resources:
       endpoint_id: 43
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.4'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource '10\.1\.2\.4'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.4'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource '10\.1\.2\.4'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsDuplicateSelectorResourceNamesInSameUpdate) {
@@ -1271,7 +1271,7 @@ resources:
       remote_identities: [ 46, 47 ]
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta .*update for version [0-9]+ has duplicate resource key 'shared-selector'.*incoming selector resource 'shared-selector'.*existing selector resource 'shared-selector')");
+      R"(NetworkPolicyResource .*update for version [0-9]+ has duplicate resource key 'shared-selector'.*incoming selector resource 'shared-selector'.*existing selector resource 'shared-selector')");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaAcceptsArbitraryPolicyResourceNamesWithHyphens) {
@@ -1359,7 +1359,7 @@ resources:
       endpoint_id: 43
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.3.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.3.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest,
@@ -1389,7 +1389,7 @@ resources:
       endpoint_id: 43
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource '10\.1\.2\.3'.*endpoint_id 43.*10\.1\.2\.4.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming policy resource '10\.1\.2\.3'.*endpoint_id 43.*10\.1\.2\.4.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest,
@@ -1419,7 +1419,7 @@ resources:
       endpoint_id: 43
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta update for version [0-9]+ has duplicate resource key '10\.1\.2\.4'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource '10\.1\.2\.4'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource update for version [0-9]+ has duplicate resource key '10\.1\.2\.4'.*incoming policy resource 'policy-b'.*endpoint_id 43.*10\.1\.2\.4.*existing policy resource '10\.1\.2\.4'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest,
@@ -1447,7 +1447,7 @@ resources:
       remote_identities: [ 43 ]
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta .*update for version [0-9]+ has duplicate resource key 'shared-name'.*incoming selector resource 'shared-name'.*existing policy resource 'shared-name'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource .*update for version [0-9]+ has duplicate resource key 'shared-name'.*incoming selector resource 'shared-name'.*existing policy resource 'shared-name'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest,
@@ -1475,7 +1475,7 @@ resources:
       remote_identities: [ 43 ]
 )EOF"),
       EnvoyException,
-      R"(Network Policy delta .*update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming selector resource '10\.1\.2\.3'.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
+      R"(NetworkPolicyResource .*update for version [0-9]+ has duplicate resource key '10\.1\.2\.3'.*incoming selector resource '10\.1\.2\.3'.*existing endpoint IP alias '10\.1\.2\.3' owned by policy resource 'policy-a'.*endpoint_id 42.*10\.1\.2\.3)");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsRemovingPolicyEndpointIpAlias) {
@@ -1497,7 +1497,7 @@ removed_resources:
 - "10.1.2.3"
 )EOF"),
       EnvoyException,
-      "Network Policy delta removed resource '10.1.2.3' is a policy endpoint IP alias, not a "
+      "NetworkPolicyResource removed resource '10.1.2.3' is a policy endpoint IP alias, not a "
       "resource name");
 }
 
@@ -1569,7 +1569,7 @@ resources:
       - "10.1.2.3"
       endpoint_id: 0
 )EOF"),
-                            EnvoyException, "Network Policy endpoint_id must be non-zero");
+                            EnvoyException, "NetworkPolicyResource endpoint_id must be non-zero");
 }
 
 TEST_F(CiliumNetworkPolicyDeltaTest, DeltaRejectsInconsistentPassPrecedence) {

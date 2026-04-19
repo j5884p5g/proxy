@@ -249,12 +249,12 @@ public:
     const auto* entry = findEntry(selector);
     if (entry == nullptr) {
       throw EnvoyException(fmt::format(
-          "Delta Network Policy rule references missing selector resource '{}'", selector));
+          "NetworkPolicyResource rule references missing selector resource '{}'", selector));
     }
     const auto* selector_entry = entry->selectorResourceEntry();
     if (selector_entry == nullptr || selector_entry->handle == nullptr) {
       throw EnvoyException(
-          fmt::format("Delta Network Policy rule references non-selector resource '{}'", selector));
+          fmt::format("NetworkPolicyResource rule references non-selector resource '{}'", selector));
     }
     return selector_entry->handle;
   }
@@ -951,7 +951,7 @@ public:
     if (resource_map) {
       if (rule.remote_policies_size()) {
         throw EnvoyException(
-            "Delta Network Policy rule must use selectors instead of remote_policies");
+            "NetworkPolicyResource rule must use selectors instead of remote_policies");
       }
       selectors_.reserve(rule.selectors_size());
       for (const auto& selector : rule.selectors()) {
@@ -961,7 +961,7 @@ public:
       }
     } else {
       if (rule.selectors_size()) {
-        throw EnvoyException("State-of-the-world Network Policy rule must not use selectors");
+        throw EnvoyException("NetworkPolicy rule must not use selectors");
       }
       for (const auto remote : rule.remote_policies()) {
         ENVOY_LOG(trace, "Cilium L7 PortNetworkPolicyRule(): {} remote {} by rule: {}", verdict_,
@@ -1594,7 +1594,7 @@ struct PortRangeCompare {
 
 // PolicySnapshot is keyed by port ranges, and contains a list of PortNetworkPolicyRules's
 // applicable to this range. A list is needed as rules may come from multiple sources (e.g.,
-// resulting from use of named ports and numbered ports in Cilium Network Policy at the same time).
+// resulting from use of named ports and numbered ports in Cilium NetworkPolicy at the same time).
 class PolicySnapshot : public absl::btree_map<PortRange, PortNetworkPolicyRules, PortRangeCompare> {
 public:
   using absl::btree_map<PortRange, PortNetworkPolicyRules, PortRangeCompare>::btree_map;
@@ -2256,7 +2256,7 @@ NetworkPolicyMapImpl::NetworkPolicyMapImpl(Server::Configuration::FactoryContext
       context_(context.serverFactoryContext()), map_ptr_(nullptr),
       npds_stats_scope_(context_.serverScope().createScope("cilium.npds.")),
       policy_stats_scope_(context_.serverScope().createScope("cilium.policy.")),
-      init_target_(fmt::format("Cilium Network Policy subscription start"),
+      init_target_(fmt::format("Cilium NetworkPolicy subscription start"),
                    [this]() {
                      // production subscription is allowed to start from now on
                      subscription_should_start_ = true;
@@ -2479,8 +2479,8 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   // policy_stream_state_ gets updated on first successful update,
   // so 'is_new_stream' remains 'true' as long as the stream has not had a successful update yet.
   const bool is_new_stream = stream_generation != policy_stream_state_->streamGeneration();
-  ENVOY_LOG(debug, "NetworkPolicyMapImpl::onConfigUpdate({}), {} resources, version: {}",
-            instance_id_, resources.size(), version_info);
+  ENVOY_LOG(debug, "NetworkPolicyMapImpl::onConfigUpdate({}), {} resources, version: {}, stream {}",
+            instance_id_, resources.size(), version_info, stream_generation);
   stats_.updates_total_.inc();
 
   // Reopen IPcache for every new stream. Cilium agent re-creates IP cache on restart,
@@ -2488,7 +2488,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   // New security identities (e.g., for FQDN policies) only get inserted to the new IP cache,
   // so open it before the workers get a chance to enforce policy on the new IDs.
   if (is_new_stream) {
-    ENVOY_LOG(info, "New NetworkPolicy stream");
+    ENVOY_LOG(info, "New NetworkPolicy stream {}", stream_generation);
 
     reopenIpcache();
   }
@@ -2510,12 +2510,12 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     for (const auto& resource : resources) {
       const auto& config = dynamic_cast<const cilium::NetworkPolicy&>(resource.get().resource());
       const std::string& resource_name = resource.get().name();
-      validateResourceName(resource_name, "Network Policy resource name");
+      validateResourceName(resource_name, "NetworkPolicy resource name");
       if (config.endpoint_ips().empty()) {
-        throw EnvoyException("Network Policy has no endpoint ips");
+        throw EnvoyException("NetworkPolicy has no endpoint ips");
       }
       ENVOY_LOG(debug,
-                "Received Network Policy for endpoint {}, endpoint_ip {} in onConfigUpdate() "
+                "Received NetworkPolicy for endpoint {}, endpoint_ip {} in onConfigUpdate() "
                 "version {}",
                 config.endpoint_id(), config.endpoint_ips()[0], version_info);
 
@@ -2560,7 +2560,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   bool updates_policies = false;
   bool updates_selectors = false;
   for (const auto& removed_resource : removed_resources) {
-    validateResourceName(removed_resource, "Network Policy delta removed resource name");
+    validateResourceName(removed_resource, "NetworkPolicyResource removed resource name");
     auto resource_it = resource_map_.find(removed_resource);
     if (resource_it == resource_map_.end()) {
       continue;
@@ -2576,9 +2576,9 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
         dynamic_cast<const cilium::NetworkPolicyResource&>(resource.get().resource());
     const std::string& resource_name = resource.get().name();
     if (resource_name.empty()) {
-      throw EnvoyException("Network Policy delta resource has no name");
+      throw EnvoyException("NetworkPolicyResource has no name");
     }
-    validateResourceName(resource_name, "Network Policy delta resource name");
+    validateResourceName(resource_name, "NetworkPolicyResource added resource name");
     switch (typed_resource.resource_case()) {
     case cilium::NetworkPolicyResource::kPolicy:
       updates_policies = true;
@@ -2593,9 +2593,9 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
 
   ENVOY_LOG(debug,
             "NetworkPolicyMapImpl::onConfigUpdate({}), {} added resources, {} removed resources, "
-            "version: {}, updates_selectors: {}, updates_policies: {}",
+            "version: {}, stream {}, updates_selectors: {}, updates_policies: {}",
             instance_id_, added_resources.size(), removed_resources.size(), system_version_info,
-            updates_selectors, updates_policies);
+            stream_generation, updates_selectors, updates_policies);
   stats_.updates_total_.inc();
 
   // Reopen IPcache for every new stream. Cilium agent re-creates IP cache on restart,
@@ -2603,7 +2603,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
   // New security identities (e.g., for FQDN policies) only get inserted to the new IP cache,
   // so open it before the workers get a chance to enforce policy on the new IDs.
   if (is_new_stream) {
-    ENVOY_LOG(info, "New NetworkPolicy stream");
+    ENVOY_LOG(info, "New NetworkPolicyResource stream {}", stream_generation);
     reopenIpcache();
   }
   removeInitManager();
@@ -2615,24 +2615,24 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
       const auto selector_update_version = selector_map_.prepareNextVersion();
 
       for (const auto& resource : removed_resources) {
-        ENVOY_LOG(trace, "Cilium removing network policy selector resource {}", resource);
+        ENVOY_LOG(trace, "Cilium removing NetworkPolicyResource selector {}", resource);
         const auto* resource_entry = pending_resource_map.findEntry(resource);
         if (resource_entry == nullptr) {
           ENVOY_LOG(
               debug,
-              "NetworkPolicy delta removed selector resource name '{}' not found from resource map",
+              "NetworkPolicyResource removed selector name '{}' not found from resource map",
               resource);
           continue;
         }
         if (resource_entry->isPolicyEndpointIpEntry()) {
-          throw EnvoyException(fmt::format("NetworkPolicy delta removed selector resource name "
+          throw EnvoyException(fmt::format("NetworkPolicyResource removed selector name "
                                            "'{}' is a policy endpoint IP alias, "
                                            "not a resource name",
                                            resource));
         }
         if (resource_entry->policyResourceEntry()) {
           throw EnvoyException(fmt::format(
-              "NetworkPolicy delta removed selector resource name '{}' refers to a policy resource",
+              "NetworkPolicyResource removed selector name '{}' refers to a policy resource",
               resource));
         }
         selector_map_.clear(resource);
@@ -2657,7 +2657,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
         switch (typed_resource.resource_case()) {
         case cilium::NetworkPolicyResource::kSelector: {
           ENVOY_LOG(debug,
-                    "Received delta Network Policy selector resource {} in onConfigUpdate() "
+                    "Received NetworkPolicyResource selector {} in onConfigUpdate() "
                     "version {}",
                     resource_name, system_version_info);
           auto selector_handle = createOrReuseSelector(resource_name, typed_resource.selector(),
@@ -2665,7 +2665,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
           if (!pending_resource_map.emplace(resource_name,
                                             ResourceKey::selectorResource(selector_handle))) {
             throw EnvoyException(fmt::format(
-                "Network Policy delta selector update for version {} has duplicate resource key "
+                "NetworkPolicyResource selector update for version {} has duplicate resource key "
                 "'{}' on an old stream: "
                 "incoming selector resource '{}' collides with existing {}",
                 system_version_info, resource_name, resource_name,
@@ -2674,14 +2674,14 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
           break;
         }
         case cilium::NetworkPolicyResource::kPolicy:
-          IS_ENVOY_BUG("Selector-only delta Network Policy update unexpectedly included a policy");
+          IS_ENVOY_BUG("Selector-only NetworkPolicyResource update unexpectedly included a policy");
           break;
         case cilium::NetworkPolicyResource::RESOURCE_NOT_SET:
-          throw EnvoyException("Network Policy delta resource has no payload");
+          throw EnvoyException("NetworkPolicyResource has no payload");
         }
       }
     } catch (const EnvoyException& e) {
-      ENVOY_LOG(warn, "NetworkPolicy delta update for version {} failed: {}", system_version_info,
+      ENVOY_LOG(warn, "NetworkPolicyResource update for version {} failed: {}", system_version_info,
                 e.what());
       stats_.updates_rejected_.inc();
       scheduleSelectorDeferredDeletion(selector_map_.revert());
@@ -2717,7 +2717,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
     const auto selector_update_version = selector_map_.prepareNextVersion();
 
     for (const auto& removed_resource : removed_resources) {
-      ENVOY_LOG(trace, "Cilium removing network policy resource {}", removed_resource);
+      ENVOY_LOG(trace, "Cilium removing NetworkPolicyResource {}", removed_resource);
       const auto* resource_entry = pending_resource_map.findEntry(removed_resource);
       if (resource_entry == nullptr) {
         continue;
@@ -2731,7 +2731,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
         continue;
       }
       throw EnvoyException(
-          fmt::format("Network Policy delta removed resource '{}' is a policy endpoint IP alias, "
+          fmt::format("NetworkPolicyResource removed resource '{}' is a policy endpoint IP alias, "
                       "not a resource name",
                       removed_resource));
     }
@@ -2767,7 +2767,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
       }
 
       ENVOY_LOG(debug,
-                "Received delta Network Policy selector resource {} in onConfigUpdate() "
+                "Received NetworkPolicyResource selector {} in onConfigUpdate() "
                 "version {}",
                 resource_name, system_version_info);
       auto selector_handle =
@@ -2775,7 +2775,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
       if (!pending_resource_map.emplace(resource_name,
                                         ResourceKey::selectorResource(selector_handle))) {
         throw EnvoyException(fmt::format(
-            "Network Policy delta update for version {} has duplicate resource key '{}' on {} "
+            "NetworkPolicyResource update for version {} has duplicate resource key '{}' on {} "
             "stream: "
             "incoming selector resource '{}' collides with existing {}",
             system_version_info, resource_name, is_new_stream ? "a new" : "an old", resource_name,
@@ -2794,13 +2794,13 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
       case cilium::NetworkPolicyResource::kPolicy: {
         const auto& config = typed_resource.policy();
         if (config.endpoint_ips().empty()) {
-          throw EnvoyException("Network Policy has no endpoint ips");
+          throw EnvoyException("NetworkPolicyResource has no endpoint ips");
         }
         if (config.endpoint_id() == 0) {
-          throw EnvoyException("Network Policy endpoint_id must be non-zero");
+          throw EnvoyException("NetworkPolicyResource endpoint_id must be non-zero");
         }
         ENVOY_LOG(debug,
-                  "Received delta Network Policy resource {} for endpoint {}, endpoint_ip {} in "
+                  "Received NetworkPolicyResource {} for endpoint {}, endpoint_ip {} in "
                   "onConfigUpdate() version {}",
                   resource_name, config.endpoint_id(), config.endpoint_ips()[0],
                   system_version_info);
@@ -2809,7 +2809,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
                                           &pending_resource_map);
         if (!pending_resource_map.emplace(resource_name, ResourceKey::policyResource(policy))) {
           throw EnvoyException(fmt::format(
-              "Network Policy delta update for version {} has duplicate resource key '{}' on {} "
+              "NetworkPolicyResource update for version {} has duplicate resource key '{}' on {} "
               "stream: "
               "incoming {} collides with existing {}",
               system_version_info, resource_name, is_new_stream ? "a new" : "an old",
@@ -2820,7 +2820,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
           ENVOY_LOG(trace, "Cilium updating network policy for endpoint {}", endpoint_ip);
           if (!pending_resource_map.emplace(endpoint_ip, ResourceKey::policyEndpointIp())) {
             throw EnvoyException(fmt::format(
-                "Network Policy delta update for version {} has duplicate resource key '{}' on {} "
+                "NetworkPolicyResource update for version {} has duplicate resource key '{}' on {} "
                 "stream: "
                 "incoming {} collides with existing {}",
                 system_version_info, endpoint_ip, is_new_stream ? "a new" : "an old",
@@ -2829,7 +2829,7 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
           }
           if (!new_policy_map.emplace(endpoint_ip, policy).second) {
             throw EnvoyException(fmt::format(
-                "Network Policy delta update for version {} has duplicate resource key '{}' on {} "
+                "NetworkPolicyResource update for version {} has duplicate resource key '{}' on {} "
                 "stream: "
                 "incoming {} collides with existing {}",
                 system_version_info, endpoint_ip, is_new_stream ? "a new" : "an old",
@@ -2840,11 +2840,11 @@ absl::Status NetworkPolicyMapImpl::onConfigUpdate(
         break;
       }
       case cilium::NetworkPolicyResource::RESOURCE_NOT_SET:
-        throw EnvoyException("Network Policy delta resource has no payload");
+        throw EnvoyException("NetworkPolicyResource has no payload");
       }
     }
   } catch (const EnvoyException& e) {
-    ENVOY_LOG(warn, "NetworkPolicy delta update for version {} failed: {}", system_version_info,
+    ENVOY_LOG(warn, "NetworkPolicyResource update for version {} failed: {}", system_version_info,
               e.what());
     stats_.updates_rejected_.inc();
     removeInitManager();
@@ -2867,7 +2867,8 @@ void NetworkPolicyMapImpl::onConfigUpdateFailed(Envoy::Config::ConfigUpdateFailu
                                                 const EnvoyException*) {
   // We need to allow server startup to continue, even if we have a bad
   // config.
-  ENVOY_LOG(debug, "Network Policy Update failed, keeping existing policy.");
+  ENVOY_LOG(debug, "NetworkPolicy update on stream {} failed, keeping existing policy.",
+            streamGeneration());
 }
 
 ProtobufTypes::MessagePtr
